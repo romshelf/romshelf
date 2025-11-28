@@ -30,7 +30,32 @@ pub fn parse_dat(path: &Path) -> Result<ParsedDat> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read DAT file: {}", path.display()))?;
 
-    parse_logiqx_xml(&content)
+    // Strip UTF-8 BOM if present
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+
+    parse_logiqx_xml(content)
+}
+
+/// Compute SHA1 hash of a DAT file for duplicate detection
+pub fn hash_dat_file(path: &Path) -> Result<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("Failed to open DAT file: {}", path.display()))?;
+
+    let mut hasher = Sha1::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Parse Logiqx XML format (used by TOSEC, No-Intro, Redump)

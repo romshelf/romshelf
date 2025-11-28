@@ -41,6 +41,20 @@ enum Commands {
         #[arg(long)]
         issues: bool,
     },
+    /// Organise ROMs into a structured directory
+    Organise {
+        /// Target directory for organised ROMs
+        #[arg(long)]
+        target: PathBuf,
+
+        /// Dry run - show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Copy files instead of moving them
+        #[arg(long)]
+        copy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -48,6 +62,11 @@ enum DatCommands {
     /// Import a DAT file
     Import {
         /// Path to DAT file
+        path: PathBuf,
+    },
+    /// Import all DAT files from a directory (recursive)
+    ImportDir {
+        /// Directory containing DAT files
         path: PathBuf,
     },
     /// List imported DATs
@@ -64,10 +83,12 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Dat { command } => match command {
             DatCommands::Import { path } => cmd_dat_import(&conn, &path),
+            DatCommands::ImportDir { path } => cmd_dat_import_dir(&conn, &path),
             DatCommands::List => cmd_dat_list(&conn),
         },
         Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads),
         Commands::Verify { issues } => cmd_verify(&conn, issues),
+        Commands::Organise { target, dry_run, copy } => cmd_organise(&conn, &target, dry_run, copy),
     }
 }
 
@@ -78,15 +99,138 @@ fn get_db_path() -> Result<PathBuf> {
     Ok(config_dir.join("bitshelf.db"))
 }
 
-fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
-    eprintln!("Importing DAT from {}...", path.display());
+/// Import result for tracking duplicates
+enum ImportResult {
+    Imported { name: String, version: Option<String>, entries: usize },
+    Duplicate { name: String },
+    Failed { path: PathBuf, error: String },
+}
 
-    let parsed = dat::parse_dat(path)?;
+fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
+    match import_single_dat(conn, path)? {
+        ImportResult::Imported { name, version, entries } => {
+            println!("Imported: {}", name);
+            if let Some(v) = version {
+                println!("  Version: {}", v);
+            }
+            println!("  Entries: {}", entries);
+        }
+        ImportResult::Duplicate { name } => {
+            println!("Skipped (duplicate): {}", name);
+        }
+        ImportResult::Failed { path, error } => {
+            eprintln!("Failed to import {}: {}", path.display(), error);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
+    use walkdir::WalkDir;
+
+    eprintln!("Scanning for DAT files in {}...", path.display());
+
+    let dat_files: Vec<PathBuf> = WalkDir::new(path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().is_file()
+                && e.path()
+                    .extension()
+                    .map(|ext| ext.to_ascii_lowercase() == "dat")
+                    .unwrap_or(false)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    eprintln!("Found {} DAT files", dat_files.len());
+
+    let mut imported = 0;
+    let mut duplicates = 0;
+    let mut failed = 0;
+
+    for (i, dat_path) in dat_files.iter().enumerate() {
+        eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
+
+        match import_single_dat(conn, dat_path) {
+            Ok(ImportResult::Imported { .. }) => imported += 1,
+            Ok(ImportResult::Duplicate { .. }) => duplicates += 1,
+            Ok(ImportResult::Failed { path, error }) => {
+                eprintln!("\n  Failed: {} - {}", path.display(), error);
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("\n  Error: {} - {}", dat_path.display(), e);
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!(); // New line after progress
+    println!("\nImport complete:");
+    println!("  Imported:   {:>6}", imported);
+    println!("  Duplicates: {:>6}", duplicates);
+    if failed > 0 {
+        println!("  Failed:     {:>6}", failed);
+    }
+
+    Ok(())
+}
+
+fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf) -> Result<ImportResult> {
+    // Hash the DAT file first for duplicate detection
+    let file_sha1 = match dat::hash_dat_file(path) {
+        Ok(hash) => hash,
+        Err(e) => {
+            return Ok(ImportResult::Failed {
+                path: path.clone(),
+                error: e.to_string(),
+            });
+        }
+    };
+
+    // Check if this exact DAT already exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM dats WHERE file_sha1 = ?1",
+            [&file_sha1],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if exists {
+        // Get the name for reporting
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM dats WHERE file_sha1 = ?1",
+                [&file_sha1],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "Unknown".to_string());
+        return Ok(ImportResult::Duplicate { name });
+    }
+
+    // Parse the DAT
+    let parsed = match dat::parse_dat(path) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ImportResult::Failed {
+                path: path.clone(),
+                error: e.to_string(),
+            });
+        }
+    };
 
     // Insert DAT record
     conn.execute(
-        "INSERT INTO dats (name, format, file_path) VALUES (?1, ?2, ?3)",
-        [&parsed.name, "logiqx", &path.to_string_lossy().to_string()],
+        "INSERT INTO dats (name, format, file_path, file_sha1) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            &parsed.name,
+            "logiqx",
+            &path.to_string_lossy().to_string(),
+            &file_sha1
+        ],
     )?;
     let dat_id = conn.last_insert_rowid();
 
@@ -94,12 +238,7 @@ fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO dat_versions (dat_id, version, loaded_at, entry_count) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![
-            dat_id,
-            parsed.version,
-            now,
-            parsed.entries.len() as i64
-        ],
+        rusqlite::params![dat_id, parsed.version, now, parsed.entries.len() as i64],
     )?;
     let version_id = conn.last_insert_rowid();
 
@@ -119,13 +258,11 @@ fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
         ])?;
     }
 
-    println!("Imported: {}", parsed.name);
-    if let Some(version) = &parsed.version {
-        println!("  Version: {}", version);
-    }
-    println!("  Entries: {}", parsed.entries.len());
-
-    Ok(())
+    Ok(ImportResult::Imported {
+        name: parsed.name,
+        version: parsed.version,
+        entries: parsed.entries.len(),
+    })
 }
 
 fn cmd_dat_list(conn: &rusqlite::Connection) -> Result<()> {
@@ -380,4 +517,173 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_organise(
+    conn: &rusqlite::Connection,
+    target: &PathBuf,
+    dry_run: bool,
+    copy: bool,
+) -> Result<()> {
+    // Load all matched files with their DAT info
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.filename, de.name as rom_name, d.name as dat_name
+         FROM files f
+         JOIN dat_entries de ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         JOIN dat_versions dv ON de.dat_version_id = dv.id
+         JOIN dats d ON dv.dat_id = d.id",
+    )?;
+
+    let matches: Vec<(PathBuf, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if matches.is_empty() {
+        println!("No matched files to organise. Run `bitshelf scan` and `bitshelf verify` first.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        if dry_run {
+            "Dry run - showing what would be done:"
+        } else {
+            "Organising files..."
+        }
+    );
+
+    let mut organised = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+    let mut seen_archives: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    for (source_path, _filename, rom_name, dat_name) in &matches {
+        // Handle archive paths (archive.zip#entry.rom)
+        let (actual_source, target_filename) = if let Some(hash_pos) =
+            source_path.to_string_lossy().find('#')
+        {
+            // File is inside an archive - organise the archive itself
+            let archive_path_str = &source_path.to_string_lossy()[..hash_pos];
+            let archive_path = PathBuf::from(archive_path_str);
+
+            // Skip if we've already processed this archive
+            if seen_archives.contains(&archive_path) {
+                continue;
+            }
+            seen_archives.insert(archive_path.clone());
+
+            // Use the archive filename, keeping the extension
+            let archive_filename = archive_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown.zip".to_string());
+
+            (archive_path, archive_filename)
+        } else {
+            // Loose file - use the ROM name from the DAT
+            (source_path.clone(), rom_name.clone())
+        };
+
+        // Create target path: target/dat_name/filename
+        let target_dir = target.join(sanitise_path(dat_name));
+        let target_path = target_dir.join(&target_filename);
+
+        // Check if source exists
+        if !actual_source.exists() {
+            if dry_run {
+                println!("  [MISSING] {}", actual_source.display());
+            }
+            skipped += 1;
+            continue;
+        }
+
+        // Check if target already exists
+        if target_path.exists() {
+            if dry_run {
+                println!("  [EXISTS] {}", target_path.display());
+            }
+            skipped += 1;
+            continue;
+        }
+
+        if dry_run {
+            println!(
+                "  {} {} -> {}",
+                if copy { "[COPY]" } else { "[MOVE]" },
+                actual_source.display(),
+                target_path.display()
+            );
+            organised += 1;
+        } else {
+            // Create target directory
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                eprintln!("  Error creating {}: {}", target_dir.display(), e);
+                errors += 1;
+                continue;
+            }
+
+            // Copy or move the file
+            let result = if copy {
+                std::fs::copy(&actual_source, &target_path).map(|_| ())
+            } else {
+                std::fs::rename(&actual_source, &target_path)
+            };
+
+            match result {
+                Ok(()) => {
+                    organised += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  Error {} {}: {}",
+                        if copy { "copying" } else { "moving" },
+                        actual_source.display(),
+                        e
+                    );
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "{}:",
+        if dry_run {
+            "Would organise"
+        } else {
+            "Organised"
+        }
+    );
+    println!(
+        "  {}: {:>6}",
+        if copy { "Copied" } else { "Moved" },
+        organised
+    );
+    if skipped > 0 {
+        println!("  Skipped:  {:>6}", skipped);
+    }
+    if errors > 0 {
+        println!("  Errors:   {:>6}", errors);
+    }
+
+    Ok(())
+}
+
+/// Sanitise a string for use as a directory/file name
+fn sanitise_path(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
 }

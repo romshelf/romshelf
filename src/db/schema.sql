@@ -5,8 +5,12 @@ CREATE TABLE IF NOT EXISTS dats (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     format TEXT NOT NULL,
-    file_path TEXT NOT NULL
+    file_path TEXT NOT NULL,
+    file_sha1 TEXT NOT NULL
 );
+
+-- Index for duplicate detection
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dats_sha1 ON dats(file_sha1);
 
 CREATE TABLE IF NOT EXISTS dat_versions (
     id INTEGER PRIMARY KEY,
