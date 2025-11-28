@@ -11,14 +11,27 @@ use std::path::Path;
 pub struct ParsedDat {
     pub name: String,
     pub version: Option<String>,
-    pub entries: Vec<DatEntry>,
+    pub sets: Vec<DatSet>,
 }
 
-/// A single entry from a DAT file
+impl ParsedDat {
+    /// Total number of ROM entries across all sets
+    pub fn entry_count(&self) -> usize {
+        self.sets.iter().map(|s| s.roms.len()).sum()
+    }
+}
+
+/// A set (game, application, etc.) containing one or more ROMs
+#[derive(Debug, Clone)]
+pub struct DatSet {
+    pub name: String,
+    pub roms: Vec<DatEntry>,
+}
+
+/// A single ROM entry within a set
 #[derive(Debug, Clone)]
 pub struct DatEntry {
     pub name: String,
-    pub rom_name: String,
     pub size: u64,
     pub crc32: Option<String>,
     pub md5: Option<String>,
@@ -66,12 +79,12 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
     let mut dat = ParsedDat {
         name: String::new(),
         version: None,
-        entries: Vec::new(),
+        sets: Vec::new(),
     };
 
     let mut buf = Vec::new();
     let mut current_path: Vec<String> = Vec::new();
-    let mut current_game_name: Option<String> = None;
+    let mut current_set: Option<DatSet> = None;
     let mut in_header = false;
     let mut current_text_target: Option<&str> = None;
 
@@ -85,41 +98,25 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                     "header" => in_header = true,
                     "name" if in_header => current_text_target = Some("name"),
                     "version" if in_header => current_text_target = Some("version"),
-                    "game" | "machine" => {
-                        // Get name attribute
+                    "game" | "machine" | "software" => {
+                        // Start a new set - get name attribute
+                        let mut set_name = String::new();
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"name" {
-                                current_game_name =
-                                    Some(String::from_utf8_lossy(&attr.value).to_string());
+                                set_name = String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
+                        current_set = Some(DatSet {
+                            name: set_name,
+                            roms: Vec::new(),
+                        });
                     }
                     "rom" => {
-                        // Parse ROM element attributes
-                        let mut entry = DatEntry {
-                            name: current_game_name.clone().unwrap_or_default(),
-                            rom_name: String::new(),
-                            size: 0,
-                            crc32: None,
-                            md5: None,
-                            sha1: None,
-                        };
-
-                        for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let value = String::from_utf8_lossy(&attr.value).to_string();
-
-                            match key.as_ref() {
-                                "name" => entry.rom_name = value,
-                                "size" => entry.size = value.parse().unwrap_or(0),
-                                "crc" => entry.crc32 = Some(value.to_lowercase()),
-                                "md5" => entry.md5 = Some(value.to_lowercase()),
-                                "sha1" => entry.sha1 = Some(value.to_lowercase()),
-                                _ => {}
-                            }
+                        // Parse ROM element attributes and add to current set
+                        let entry = parse_rom_attributes(&e);
+                        if let Some(ref mut set) = current_set {
+                            set.roms.push(entry);
                         }
-
-                        dat.entries.push(entry);
                     }
                     _ => {}
                 }
@@ -129,7 +126,14 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
 
                 match tag_name.as_str() {
                     "header" => in_header = false,
-                    "game" | "machine" => current_game_name = None,
+                    "game" | "machine" | "software" => {
+                        // End of set - push it if it has ROMs
+                        if let Some(set) = current_set.take() {
+                            if !set.roms.is_empty() {
+                                dat.sets.push(set);
+                            }
+                        }
+                    }
                     _ => {}
                 }
 
@@ -150,30 +154,10 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                 // Handle self-closing <rom /> elements
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if tag_name == "rom" {
-                    let mut entry = DatEntry {
-                        name: current_game_name.clone().unwrap_or_default(),
-                        rom_name: String::new(),
-                        size: 0,
-                        crc32: None,
-                        md5: None,
-                        sha1: None,
-                    };
-
-                    for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let value = String::from_utf8_lossy(&attr.value).to_string();
-
-                        match key.as_ref() {
-                            "name" => entry.rom_name = value,
-                            "size" => entry.size = value.parse().unwrap_or(0),
-                            "crc" => entry.crc32 = Some(value.to_lowercase()),
-                            "md5" => entry.md5 = Some(value.to_lowercase()),
-                            "sha1" => entry.sha1 = Some(value.to_lowercase()),
-                            _ => {}
-                        }
+                    let entry = parse_rom_attributes(&e);
+                    if let Some(ref mut set) = current_set {
+                        set.roms.push(entry);
                     }
-
-                    dat.entries.push(entry);
                 }
             }
             Ok(Event::Eof) => break,
@@ -190,6 +174,33 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
     }
 
     Ok(dat)
+}
+
+/// Parse ROM attributes from an XML element
+fn parse_rom_attributes(e: &quick_xml::events::BytesStart) -> DatEntry {
+    let mut entry = DatEntry {
+        name: String::new(),
+        size: 0,
+        crc32: None,
+        md5: None,
+        sha1: None,
+    };
+
+    for attr in e.attributes().flatten() {
+        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let value = String::from_utf8_lossy(&attr.value).to_string();
+
+        match key.as_ref() {
+            "name" => entry.name = value,
+            "size" => entry.size = value.parse().unwrap_or(0),
+            "crc" => entry.crc32 = Some(value.to_lowercase()),
+            "md5" => entry.md5 = Some(value.to_lowercase()),
+            "sha1" => entry.sha1 = Some(value.to_lowercase()),
+            _ => {}
+        }
+    }
+
+    entry
 }
 
 #[cfg(test)]
@@ -212,15 +223,16 @@ mod tests {
         let dat = parse_logiqx_xml(xml).unwrap();
         assert_eq!(dat.name, "Test DAT");
         assert_eq!(dat.version, Some("2025-01-30".to_string()));
-        assert_eq!(dat.entries.len(), 1);
-        assert_eq!(dat.entries[0].name, "Test Game");
-        assert_eq!(dat.entries[0].rom_name, "test.rom");
-        assert_eq!(dat.entries[0].size, 1024);
-        assert_eq!(dat.entries[0].crc32, Some("abcd1234".to_string()));
+        assert_eq!(dat.sets.len(), 1);
+        assert_eq!(dat.sets[0].name, "Test Game");
+        assert_eq!(dat.sets[0].roms.len(), 1);
+        assert_eq!(dat.sets[0].roms[0].name, "test.rom");
+        assert_eq!(dat.sets[0].roms[0].size, 1024);
+        assert_eq!(dat.sets[0].roms[0].crc32, Some("abcd1234".to_string()));
     }
 
     #[test]
-    fn test_parse_multiple_entries() {
+    fn test_parse_multiple_sets() {
         let xml = r#"<?xml version="1.0"?>
 <datafile>
   <header>
@@ -235,8 +247,33 @@ mod tests {
 </datafile>"#;
 
         let dat = parse_logiqx_xml(xml).unwrap();
-        assert_eq!(dat.entries.len(), 2);
-        assert_eq!(dat.entries[0].name, "Game 1");
-        assert_eq!(dat.entries[1].name, "Game 2");
+        assert_eq!(dat.sets.len(), 2);
+        assert_eq!(dat.sets[0].name, "Game 1");
+        assert_eq!(dat.sets[1].name, "Game 2");
+        assert_eq!(dat.entry_count(), 2);
+    }
+
+    #[test]
+    fn test_parse_multi_rom_set() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>Multi-ROM Test</name>
+  </header>
+  <game name="Multi Disk Game">
+    <rom name="disk1.adf" size="901120" crc="11111111"/>
+    <rom name="disk2.adf" size="901120" crc="22222222"/>
+    <rom name="disk3.adf" size="901120" crc="33333333"/>
+  </game>
+</datafile>"#;
+
+        let dat = parse_logiqx_xml(xml).unwrap();
+        assert_eq!(dat.sets.len(), 1);
+        assert_eq!(dat.sets[0].name, "Multi Disk Game");
+        assert_eq!(dat.sets[0].roms.len(), 3);
+        assert_eq!(dat.sets[0].roms[0].name, "disk1.adf");
+        assert_eq!(dat.sets[0].roms[1].name, "disk2.adf");
+        assert_eq!(dat.sets[0].roms[2].name, "disk3.adf");
+        assert_eq!(dat.entry_count(), 3);
     }
 }

@@ -21,10 +21,21 @@ CREATE TABLE IF NOT EXISTS dat_versions (
     entry_count INTEGER NOT NULL
 );
 
--- DAT entries (simplified - no parsed fields yet)
+-- Sets (groups of ROMs - games, applications, etc.)
+CREATE TABLE IF NOT EXISTS sets (
+    id INTEGER PRIMARY KEY,
+    dat_version_id INTEGER NOT NULL REFERENCES dat_versions(id),
+    name TEXT NOT NULL
+);
+
+-- Index for set lookups
+CREATE INDEX IF NOT EXISTS idx_sets_dat_version ON sets(dat_version_id);
+
+-- DAT entries (ROMs within sets)
 CREATE TABLE IF NOT EXISTS dat_entries (
     id INTEGER PRIMARY KEY,
     dat_version_id INTEGER NOT NULL REFERENCES dat_versions(id),
+    set_id INTEGER REFERENCES sets(id),
     name TEXT NOT NULL,
     size INTEGER NOT NULL,
     crc32 TEXT,

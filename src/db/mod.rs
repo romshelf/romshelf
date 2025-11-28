@@ -37,6 +37,7 @@ mod tests {
 
         assert!(tables.contains(&"dats".to_string()));
         assert!(tables.contains(&"dat_versions".to_string()));
+        assert!(tables.contains(&"sets".to_string()));
         assert!(tables.contains(&"dat_entries".to_string()));
         assert!(tables.contains(&"files".to_string()));
         assert!(tables.contains(&"matches".to_string()));

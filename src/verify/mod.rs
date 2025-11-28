@@ -31,7 +31,7 @@ pub fn verify(files: &[ScannedFile], entries: &[DatEntry]) -> VerifyResult {
         if let Some((idx, entry)) = find_match(file, entries) {
             matched_entry_indices[idx] = true;
 
-            let name_correct = is_name_correct(&file.filename, &entry.rom_name);
+            let name_correct = is_name_correct(&file.filename, &entry.name);
             let m = Match {
                 file: file.clone(),
                 entry: entry.clone(),
@@ -113,10 +113,9 @@ mod tests {
         }
     }
 
-    fn make_entry(name: &str, rom_name: &str, crc32: &str, sha1: &str) -> DatEntry {
+    fn make_entry(rom_name: &str, crc32: &str, sha1: &str) -> DatEntry {
         DatEntry {
-            name: name.to_string(),
-            rom_name: rom_name.to_string(),
+            name: rom_name.to_string(),
             size: 1024,
             crc32: Some(crc32.to_string()),
             md5: None,
@@ -127,7 +126,7 @@ mod tests {
     #[test]
     fn test_verified_match() {
         let files = vec![make_file("game.rom", "abcd1234", "sha1hash")];
-        let entries = vec![make_entry("Game", "game.rom", "abcd1234", "sha1hash")];
+        let entries = vec![make_entry("game.rom", "abcd1234", "sha1hash")];
 
         let result = verify(&files, &entries);
 
@@ -140,7 +139,7 @@ mod tests {
     #[test]
     fn test_misnamed_match() {
         let files = vec![make_file("wrong_name.rom", "abcd1234", "sha1hash")];
-        let entries = vec![make_entry("Game", "correct_name.rom", "abcd1234", "sha1hash")];
+        let entries = vec![make_entry("correct_name.rom", "abcd1234", "sha1hash")];
 
         let result = verify(&files, &entries);
 
@@ -153,7 +152,7 @@ mod tests {
     #[test]
     fn test_missing_entry() {
         let files: Vec<ScannedFile> = vec![];
-        let entries = vec![make_entry("Game", "game.rom", "abcd1234", "sha1hash")];
+        let entries = vec![make_entry("game.rom", "abcd1234", "sha1hash")];
 
         let result = verify(&files, &entries);
 
@@ -166,7 +165,7 @@ mod tests {
     #[test]
     fn test_unmatched_file() {
         let files = vec![make_file("unknown.rom", "ffffffff", "unknown")];
-        let entries = vec![make_entry("Game", "game.rom", "abcd1234", "sha1hash")];
+        let entries = vec![make_entry("game.rom", "abcd1234", "sha1hash")];
 
         let result = verify(&files, &entries);
 

@@ -241,30 +241,40 @@ fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf) -> Result<Impo
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO dat_versions (dat_id, version, loaded_at, entry_count) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![dat_id, parsed.version, now, parsed.entries.len() as i64],
+        rusqlite::params![dat_id, parsed.version, now, parsed.entry_count() as i64],
     )?;
     let version_id = conn.last_insert_rowid();
 
-    // Insert entries
-    let mut stmt = conn.prepare(
-        "INSERT INTO dat_entries (dat_version_id, name, size, crc32, md5, sha1) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    // Insert sets and their entries
+    let mut set_stmt = conn.prepare(
+        "INSERT INTO sets (dat_version_id, name) VALUES (?1, ?2)",
+    )?;
+    let mut entry_stmt = conn.prepare(
+        "INSERT INTO dat_entries (dat_version_id, set_id, name, size, crc32, md5, sha1) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
 
-    for entry in &parsed.entries {
-        stmt.execute(rusqlite::params![
-            version_id,
-            entry.rom_name,
-            entry.size as i64,
-            entry.crc32,
-            entry.md5,
-            entry.sha1
-        ])?;
+    for set in &parsed.sets {
+        set_stmt.execute(rusqlite::params![version_id, set.name])?;
+        let set_id = conn.last_insert_rowid();
+
+        for rom in &set.roms {
+            entry_stmt.execute(rusqlite::params![
+                version_id,
+                set_id,
+                rom.name,
+                rom.size as i64,
+                rom.crc32,
+                rom.md5,
+                rom.sha1
+            ])?;
+        }
     }
 
+    let entry_count = parsed.entry_count();
     Ok(ImportResult::Imported {
         name: parsed.name,
         version: parsed.version,
-        entries: parsed.entries.len(),
+        entries: entry_count,
     })
 }
 
@@ -430,8 +440,7 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
         .query_map([], |row| {
             Ok((
                 dat::DatEntry {
-                    name: row.get::<_, String>(0)?.clone(),
-                    rom_name: row.get(0)?,
+                    name: row.get(0)?,
                     size: row.get::<_, i64>(1)? as u64,
                     crc32: row.get(2)?,
                     md5: row.get(3)?,
@@ -507,7 +516,7 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
         if !all_misnamed.is_empty() {
             println!("\nMISNAMED:");
             for m in &all_misnamed {
-                println!("  {} -> {}", m.file.filename, m.entry.rom_name);
+                println!("  {} -> {}", m.file.filename, m.entry.name);
             }
         }
 
@@ -528,22 +537,24 @@ fn cmd_organise(
     dry_run: bool,
     copy: bool,
 ) -> Result<()> {
-    // Load all matched files with their DAT info
+    // Load all matched files with their DAT and set info
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.filename, de.name as rom_name, d.name as dat_name
+        "SELECT f.path, f.filename, de.name as rom_name, d.name as dat_name, s.name as set_name
          FROM files f
          JOIN dat_entries de ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
          JOIN dat_versions dv ON de.dat_version_id = dv.id
-         JOIN dats d ON dv.dat_id = d.id",
+         JOIN dats d ON dv.dat_id = d.id
+         LEFT JOIN sets s ON de.set_id = s.id",
     )?;
 
-    let matches: Vec<(PathBuf, String, String, String)> = stmt
+    let matches: Vec<(PathBuf, String, String, String, Option<String>)> = stmt
         .query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -568,7 +579,7 @@ fn cmd_organise(
     let mut errors = 0;
     let mut seen_archives: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for (source_path, _filename, rom_name, dat_name) in &matches {
+    for (source_path, _filename, rom_name, dat_name, set_name) in &matches {
         // Handle archive paths (archive.zip#entry.rom)
         let (actual_source, target_filename) = if let Some(hash_pos) =
             source_path.to_string_lossy().find('#')
@@ -595,8 +606,13 @@ fn cmd_organise(
             (source_path.clone(), rom_name.clone())
         };
 
-        // Create target path: target/dat_name/filename
-        let target_dir = target.join(sanitise_path(dat_name));
+        // Create target path: target/dat_name/[set_name/]filename
+        // For multi-ROM sets, include set name as subdirectory
+        let target_dir = if let Some(set) = set_name {
+            target.join(sanitise_path(dat_name)).join(sanitise_path(set))
+        } else {
+            target.join(sanitise_path(dat_name))
+        };
         let target_path = target_dir.join(&target_filename);
 
         // Check if source exists
