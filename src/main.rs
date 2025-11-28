@@ -55,6 +55,8 @@ enum Commands {
         #[arg(long)]
         copy: bool,
     },
+    /// Show collection statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -89,6 +91,7 @@ fn main() -> Result<()> {
         Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads),
         Commands::Verify { issues } => cmd_verify(&conn, issues),
         Commands::Organise { target, dry_run, copy } => cmd_organise(&conn, &target, dry_run, copy),
+        Commands::Stats => cmd_stats(&conn),
     }
 }
 
@@ -686,4 +689,133 @@ fn sanitise_path(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
+    // Get DAT counts
+    let dat_count: i64 = conn.query_row("SELECT COUNT(*) FROM dats", [], |row| row.get(0))?;
+    let entry_count: i64 = conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
+    let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+
+    println!("Collection Summary");
+    println!("==================");
+    println!("  DATs loaded:      {:>8}", dat_count);
+    println!("  DAT entries:      {:>8}", entry_count);
+    println!("  Files scanned:    {:>8}", file_count);
+    println!();
+
+    if dat_count == 0 {
+        println!("No DATs loaded. Use `bitshelf dat import` or `bitshelf dat import-dir` first.");
+        return Ok(());
+    }
+
+    if file_count == 0 {
+        println!("No files scanned. Use `bitshelf scan <path>` first.");
+        return Ok(());
+    }
+
+    // Get per-DAT stats
+    let mut stmt = conn.prepare(
+        "SELECT
+            d.name,
+            COUNT(DISTINCT de.id) as total_entries,
+            COUNT(DISTINCT CASE WHEN f.id IS NOT NULL THEN de.id END) as matched_entries
+         FROM dats d
+         JOIN dat_versions dv ON d.id = dv.dat_id
+         JOIN dat_entries de ON dv.id = de.dat_version_id
+         LEFT JOIN files f ON (f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size))
+         GROUP BY d.id, d.name
+         ORDER BY d.name",
+    )?;
+
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Calculate totals
+    let total_entries: i64 = rows.iter().map(|(_, t, _)| t).sum();
+    let total_matched: i64 = rows.iter().map(|(_, _, m)| m).sum();
+
+    // Count unmatched files (files not in any DAT)
+    let unmatched_files: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files f
+         WHERE NOT EXISTS (
+             SELECT 1 FROM dat_entries de
+             WHERE f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let overall_pct = if total_entries > 0 {
+        (total_matched as f64 / total_entries as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    println!("Overall Progress");
+    println!("----------------");
+    println!(
+        "  Verified:         {:>8} / {} ({:.1}%)",
+        total_matched, total_entries, overall_pct
+    );
+    println!("  Missing:          {:>8}", total_entries - total_matched);
+    println!("  Unmatched files:  {:>8}", unmatched_files);
+    println!();
+
+    // Show per-DAT breakdown (only DATs with some matches or interesting stats)
+    println!("Per-DAT Breakdown");
+    println!("-----------------");
+
+    // Sort by completeness percentage descending
+    let mut sorted_rows = rows.clone();
+    sorted_rows.sort_by(|a, b| {
+        let pct_a = if a.1 > 0 { a.2 as f64 / a.1 as f64 } else { 0.0 };
+        let pct_b = if b.1 > 0 { b.2 as f64 / b.1 as f64 } else { 0.0 };
+        pct_b.partial_cmp(&pct_a).unwrap()
+    });
+
+    for (name, total, matched) in &sorted_rows {
+        if *matched == 0 && sorted_rows.len() > 20 {
+            continue; // Skip empty DATs if we have many
+        }
+
+        let pct = if *total > 0 {
+            (*matched as f64 / *total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let bar = progress_bar(pct, 20);
+        println!("  {:50} {:>5}/{:<5} {:>5.1}% {}",
+            truncate_string(name, 50),
+            matched,
+            total,
+            pct,
+            bar
+        );
+    }
+
+    // Show count of empty DATs if we skipped them
+    let empty_count = sorted_rows.iter().filter(|(_, _, m)| *m == 0).count();
+    if empty_count > 0 && sorted_rows.len() > 20 {
+        println!("  ... and {} DATs with no matches", empty_count);
+    }
+
+    Ok(())
+}
+
+fn progress_bar(pct: f64, width: usize) -> String {
+    let filled = ((pct / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        format!("{:width$}", s, width = max_len)
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
 }
