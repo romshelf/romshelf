@@ -38,6 +38,7 @@ num_cpus = "1.16"
 # Misc
 chrono = "0.4"
 dirs = "5"
+phf = { version = "0.13.1", features = ["macros"] }
 
 [dev-dependencies]
 tempfile = "3"

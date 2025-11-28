@@ -9,6 +9,7 @@ use std::time::Duration;
 use bitshelf::dat;
 use bitshelf::db;
 use bitshelf::scan::{self, ScanProgress};
+use bitshelf::tosec;
 use bitshelf::verify;
 
 #[derive(Parser)]
@@ -110,7 +111,7 @@ enum ImportResult {
 }
 
 fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
-    match import_single_dat(conn, path)? {
+    match import_single_dat(conn, path, None)? {
         ImportResult::Imported { name, version, entries } => {
             println!("Imported: {}", name);
             if let Some(v) = version {
@@ -132,6 +133,9 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
     use walkdir::WalkDir;
 
     eprintln!("Scanning for DAT files in {}...", path.display());
+
+    // Canonicalize the base path for reliable relative path calculation
+    let base_path = path.canonicalize().unwrap_or_else(|_| path.clone());
 
     let dat_files: Vec<PathBuf> = WalkDir::new(path)
         .follow_links(true)
@@ -156,7 +160,23 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
     for (i, dat_path) in dat_files.iter().enumerate() {
         eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
 
-        match import_single_dat(conn, dat_path) {
+        // Compute category from relative path (parent directory of DAT file)
+        let dir_category = dat_path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .and_then(|parent| parent.strip_prefix(&base_path).ok().map(|p| p.to_path_buf()))
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty());
+
+        // If no directory-based category, try parsing from TOSEC filename
+        let category = dir_category.or_else(|| {
+            dat_path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(tosec::parse_tosec_category)
+        });
+
+        match import_single_dat(conn, dat_path, category.as_deref()) {
             Ok(ImportResult::Imported { .. }) => imported += 1,
             Ok(ImportResult::Duplicate { .. }) => duplicates += 1,
             Ok(ImportResult::Failed { path, error }) => {
@@ -181,7 +201,7 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
     Ok(())
 }
 
-fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf) -> Result<ImportResult> {
+fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Option<&str>) -> Result<ImportResult> {
     // Hash the DAT file first for duplicate detection
     let file_sha1 = match dat::hash_dat_file(path) {
         Ok(hash) => hash,
@@ -227,12 +247,13 @@ fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf) -> Result<Impo
 
     // Insert DAT record
     conn.execute(
-        "INSERT INTO dats (name, format, file_path, file_sha1) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO dats (name, format, file_path, file_sha1, category) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             &parsed.name,
             "logiqx",
             &path.to_string_lossy().to_string(),
-            &file_sha1
+            &file_sha1,
+            category
         ],
     )?;
     let dat_id = conn.last_insert_rowid();
@@ -725,33 +746,32 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
         return Ok(());
     }
 
-    if file_count == 0 {
-        println!("No files scanned. Use `bitshelf scan <path>` first.");
-        return Ok(());
-    }
+    // Note: We'll show the category tree even without files scanned,
+    // as it's useful to see the DAT structure
 
-    // Get per-DAT stats
+    // Get per-DAT stats with category
     let mut stmt = conn.prepare(
         "SELECT
             d.name,
+            d.category,
             COUNT(DISTINCT de.id) as total_entries,
             COUNT(DISTINCT CASE WHEN f.id IS NOT NULL THEN de.id END) as matched_entries
          FROM dats d
          JOIN dat_versions dv ON d.id = dv.dat_id
          JOIN dat_entries de ON dv.id = de.dat_version_id
          LEFT JOIN files f ON (f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size))
-         GROUP BY d.id, d.name
-         ORDER BY d.name",
+         GROUP BY d.id, d.name, d.category
+         ORDER BY d.category, d.name",
     )?;
 
-    let rows: Vec<(String, i64, i64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    let rows: Vec<(String, Option<String>, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
     // Calculate totals
-    let total_entries: i64 = rows.iter().map(|(_, t, _)| t).sum();
-    let total_matched: i64 = rows.iter().map(|(_, _, m)| m).sum();
+    let total_entries: i64 = rows.iter().map(|(_, _, t, _)| t).sum();
+    let total_matched: i64 = rows.iter().map(|(_, _, _, m)| m).sum();
 
     // Count unmatched files (files not in any DAT)
     let unmatched_files: i64 = conn.query_row(
@@ -780,19 +800,30 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     println!("  Unmatched files:  {:>8}", unmatched_files);
     println!();
 
-    // Show per-DAT breakdown (only DATs with some matches or interesting stats)
+    // Check if we have any categories
+    let has_categories = rows.iter().any(|(_, cat, _, _)| cat.is_some());
+
+    if has_categories {
+        // Build tree structure from categories
+        println!("Category Tree");
+        println!("-------------");
+        print_category_tree(&rows);
+        println!();
+    }
+
+    // Show per-DAT breakdown
     println!("Per-DAT Breakdown");
     println!("-----------------");
 
     // Sort by completeness percentage descending
     let mut sorted_rows = rows.clone();
     sorted_rows.sort_by(|a, b| {
-        let pct_a = if a.1 > 0 { a.2 as f64 / a.1 as f64 } else { 0.0 };
-        let pct_b = if b.1 > 0 { b.2 as f64 / b.1 as f64 } else { 0.0 };
+        let pct_a = if a.2 > 0 { a.3 as f64 / a.2 as f64 } else { 0.0 };
+        let pct_b = if b.2 > 0 { b.3 as f64 / b.2 as f64 } else { 0.0 };
         pct_b.partial_cmp(&pct_a).unwrap()
     });
 
-    for (name, total, matched) in &sorted_rows {
+    for (name, _category, total, matched) in &sorted_rows {
         if *matched == 0 && sorted_rows.len() > 20 {
             continue; // Skip empty DATs if we have many
         }
@@ -814,12 +845,77 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     }
 
     // Show count of empty DATs if we skipped them
-    let empty_count = sorted_rows.iter().filter(|(_, _, m)| *m == 0).count();
+    let empty_count = sorted_rows.iter().filter(|(_, _, _, m)| *m == 0).count();
     if empty_count > 0 && sorted_rows.len() > 20 {
         println!("  ... and {} DATs with no matches", empty_count);
     }
 
     Ok(())
+}
+
+/// Print category tree with rollup statistics
+fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
+    use std::collections::BTreeMap;
+
+    // Build a tree: path -> (total, matched)
+    let mut tree: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+
+    for (_name, category, total, matched) in rows {
+        let cat = category.as_deref().unwrap_or("");
+
+        // Add to the full path
+        let entry = tree.entry(cat.to_string()).or_insert((0, 0));
+        entry.0 += total;
+        entry.1 += matched;
+
+        // Also add to all parent paths for rollup
+        let parts: Vec<&str> = cat.split('/').filter(|s| !s.is_empty()).collect();
+        for i in 0..parts.len() {
+            let parent = parts[..i].join("/");
+            let entry = tree.entry(parent).or_insert((0, 0));
+            entry.0 += total;
+            entry.1 += matched;
+        }
+    }
+
+    // Sort and print
+    let mut paths: Vec<_> = tree.into_iter().collect();
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Find max depth for calculating column width
+    let max_depth = paths.iter()
+        .map(|(p, _)| if p.is_empty() { 0 } else { p.matches('/').count() + 1 })
+        .max()
+        .unwrap_or(0);
+
+    // Column width: enough for deepest indent + reasonable name length
+    let name_col_width = 40 + (max_depth * 2);
+
+    for (path, (total, matched)) in &paths {
+        let depth = if path.is_empty() { 0 } else { path.matches('/').count() + 1 };
+        let indent = "  ".repeat(depth);
+        let display_name = if path.is_empty() {
+            "(root)".to_string()
+        } else {
+            path.split('/').last().unwrap_or(path).to_string()
+        };
+
+        let pct = if *total > 0 {
+            (*matched as f64 / *total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Combine indent and name, then pad to fixed width
+        let name_with_indent = format!("{}{}", indent, display_name);
+        println!("{:width$} {:>6}/{:<6} {:>5.1}%",
+            name_with_indent,
+            matched,
+            total,
+            pct,
+            width = name_col_width
+        );
+    }
 }
 
 fn progress_bar(pct: f64, width: usize) -> String {

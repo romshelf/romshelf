@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS dats (
     name TEXT NOT NULL,
     format TEXT NOT NULL,
     file_path TEXT NOT NULL,
-    file_sha1 TEXT NOT NULL
+    file_sha1 TEXT NOT NULL,
+    category TEXT
 );
 
 -- Index for duplicate detection
