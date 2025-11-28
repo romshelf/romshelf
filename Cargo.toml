@@ -27,6 +27,13 @@ thiserror = "2.0"
 # File system
 walkdir = "2.5"
 zip = "2.2"
+sevenz-rust = "0.6"
+tempfile = "3"
+
+# Parallelism
+rayon = "1.10"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
 
 # Misc
 chrono = "0.4"

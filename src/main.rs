@@ -1,11 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use bitshelf::dat;
 use bitshelf::db;
-use bitshelf::scan;
+use bitshelf::scan::{self, ScanProgress};
 use bitshelf::verify;
 
 #[derive(Parser)]
@@ -27,6 +30,10 @@ enum Commands {
     Scan {
         /// Directory to scan
         path: PathBuf,
+
+        /// Number of worker threads (default: all cores)
+        #[arg(long, short = 't')]
+        threads: Option<usize>,
     },
     /// Verify ROMs against loaded DATs
     Verify {
@@ -59,7 +66,7 @@ fn main() -> Result<()> {
             DatCommands::Import { path } => cmd_dat_import(&conn, &path),
             DatCommands::List => cmd_dat_list(&conn),
         },
-        Commands::Scan { path } => cmd_scan(&conn, &path),
+        Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads),
         Commands::Verify { issues } => cmd_verify(&conn, issues),
     }
 }
@@ -159,12 +166,47 @@ fn cmd_dat_list(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
-    eprintln!("Scanning {}...", path.display());
-    let start = Instant::now();
+fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>) -> Result<()> {
+    let thread_count = threads.unwrap_or_else(num_cpus::get).max(1);
 
-    let files = scan::scan_directory(path)?;
-    let elapsed = start.elapsed();
+    eprintln!("Scanning {} with {} threads...", path.display(), thread_count);
+
+    let progress = Arc::new(ScanProgress::new());
+    let progress_display = Arc::clone(&progress);
+
+    // Progress display thread
+    let display_handle = thread::spawn(move || {
+        loop {
+            let discovered = progress_display.discovered.load(Ordering::Relaxed);
+            let processed = progress_display.processed.load(Ordering::Relaxed);
+            let rate = progress_display.files_per_sec();
+
+            eprint!(
+                "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>6.0} files/sec  ",
+                discovered, processed, rate
+            );
+
+            // Check if we're done (processed >= discovered and discovered > 0)
+            if processed >= discovered && discovered > 0 {
+                // Give a small grace period for final items
+                thread::sleep(Duration::from_millis(100));
+                let final_processed = progress_display.processed.load(Ordering::Relaxed);
+                let final_discovered = progress_display.discovered.load(Ordering::Relaxed);
+                if final_processed >= final_discovered {
+                    break;
+                }
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!(); // New line after progress
+    });
+
+    // Run the scan
+    let result = scan::scan_directory_parallel(path, thread_count, progress)?;
+
+    // Wait for progress display to finish
+    let _ = display_handle.join();
 
     // Store scanned files in database
     let now = chrono::Utc::now().to_rfc3339();
@@ -173,7 +215,7 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
 
-    for file in &files {
+    for file in &result.files {
         stmt.execute(rusqlite::params![
             file.path.to_string_lossy().to_string(),
             file.filename,
@@ -185,15 +227,37 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
         ])?;
     }
 
-    let rate = if elapsed.as_secs_f32() > 0.0 {
-        files.len() as f32 / elapsed.as_secs_f32()
+    // Print summary
+    let rate = if result.duration.as_secs_f32() > 0.0 {
+        result.files.len() as f32 / result.duration.as_secs_f32()
     } else {
-        files.len() as f32
+        result.files.len() as f32
     };
 
-    println!("Scanning... {} files", files.len());
-    println!("  Hashing at {:.0} files/sec", rate);
-    println!("  Complete in {:.1}s", elapsed.as_secs_f32());
+    println!("\nScan complete in {:.1}s", result.duration.as_secs_f32());
+    println!("  Files:      {:>6}", result.files.len());
+
+    let total_archives = result.zip_archives + result.sevenz_archives;
+    if total_archives > 0 {
+        println!(
+            "  Archives:   {:>6} ({} ZIP, {} 7z)",
+            total_archives, result.zip_archives, result.sevenz_archives
+        );
+    }
+
+    if !result.skipped.is_empty() {
+        println!("  Skipped:    {:>6}", result.skipped.len());
+    }
+
+    println!("  Speed:      {:>6.0} files/sec", rate);
+
+    // Show skipped files if any
+    if !result.skipped.is_empty() {
+        println!("\nSkipped files:");
+        for skip in &result.skipped {
+            println!("  {} ({})", skip.path.display(), skip.reason);
+        }
+    }
 
     Ok(())
 }

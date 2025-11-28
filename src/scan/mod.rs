@@ -1,12 +1,17 @@
-//! File scanning module - directory walking, hashing, archive support
+//! File scanning module - directory walking, hashing, archive support, parallelism
 
 use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, Sender};
 use crc32fast::Hasher as Crc32Hasher;
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 use sha1::Sha1;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -21,51 +26,236 @@ pub struct ScannedFile {
     pub sha1: String,
 }
 
-/// Scan a directory and hash all files (including contents of ZIP archives)
-pub fn scan_directory(path: &Path) -> Result<Vec<ScannedFile>> {
-    let mut files = Vec::new();
-    let mut archives_scanned = 0;
+/// A file that was skipped during scanning
+#[derive(Debug, Clone)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub reason: String,
+}
 
+/// Result of a scan operation
+#[derive(Debug)]
+pub struct ScanResult {
+    pub files: Vec<ScannedFile>,
+    pub skipped: Vec<SkippedFile>,
+    pub zip_archives: u64,
+    pub sevenz_archives: u64,
+    pub duration: Duration,
+}
+
+/// Progress tracking for scans
+pub struct ScanProgress {
+    pub discovered: AtomicU64,
+    pub processed: AtomicU64,
+    pub archives_opened: AtomicU64,
+    pub start_time: Instant,
+}
+
+impl ScanProgress {
+    pub fn new() -> Self {
+        Self {
+            discovered: AtomicU64::new(0),
+            processed: AtomicU64::new(0),
+            archives_opened: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn files_per_sec(&self) -> f32 {
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        if elapsed > 0.0 {
+            self.processed.load(Ordering::Relaxed) as f32 / elapsed
+        } else {
+            0.0
+        }
+    }
+}
+
+impl Default for ScanProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Work item for the scanning queue
+enum WorkItem {
+    File(PathBuf),
+    ZipArchive(PathBuf),
+    SevenZArchive(PathBuf),
+}
+
+/// Scan a directory with parallel processing
+pub fn scan_directory_parallel(
+    path: &Path,
+    threads: usize,
+    progress: Arc<ScanProgress>,
+) -> Result<ScanResult> {
+    let start_time = Instant::now();
+    let (sender, receiver) = bounded::<WorkItem>(1000);
+
+    // Shared state for results
+    let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let zip_count = Arc::new(AtomicU64::new(0));
+    let sevenz_count = Arc::new(AtomicU64::new(0));
+
+    // Clone for discovery thread
+    let progress_discovery = Arc::clone(&progress);
+    let path_owned = path.to_path_buf();
+
+    // Discovery thread - walks directories and pushes work items
+    let discovery_handle = std::thread::spawn(move || {
+        discover_files(&path_owned, sender, &progress_discovery)
+    });
+
+    // Process work items in parallel
+    let skipped_clone = Arc::clone(&skipped);
+    let zip_count_clone = Arc::clone(&zip_count);
+    let sevenz_count_clone = Arc::clone(&sevenz_count);
+    let progress_clone = Arc::clone(&progress);
+
+    // Configure thread pool
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
+
+    let files: Vec<ScannedFile> = pool.install(|| {
+        receiver
+            .into_iter()
+            .par_bridge()
+            .flat_map(|item| {
+                let result = process_work_item(
+                    item,
+                    &skipped_clone,
+                    &zip_count_clone,
+                    &sevenz_count_clone,
+                );
+                progress_clone.processed.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+            .collect()
+    });
+
+    // Wait for discovery to finish
+    discovery_handle.join().unwrap()?;
+
+    let duration = start_time.elapsed();
+
+    // Extract skipped files - use lock() if Arc still has other refs
+    let skipped_files = match Arc::try_unwrap(skipped) {
+        Ok(mutex) => mutex.into_inner().unwrap(),
+        Err(arc) => arc.lock().unwrap().clone(),
+    };
+
+    Ok(ScanResult {
+        files,
+        skipped: skipped_files,
+        zip_archives: zip_count.load(Ordering::Relaxed),
+        sevenz_archives: sevenz_count.load(Ordering::Relaxed),
+        duration,
+    })
+}
+
+/// Discover files and push work items to queue
+fn discover_files(
+    path: &Path,
+    sender: Sender<WorkItem>,
+    progress: &ScanProgress,
+) -> Result<()> {
     for entry in WalkDir::new(path).follow_links(true) {
-        let entry = entry.with_context(|| format!("Failed to read directory entry in {}", path.display()))?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Warning: {}", e);
+                continue;
+            }
+        };
 
         if entry.file_type().is_file() {
-            let file_path = entry.path();
-
-            // Check if it's a ZIP archive
-            if is_zip_file(file_path) {
-                match scan_zip_archive(file_path) {
-                    Ok(mut archive_files) => {
-                        archives_scanned += 1;
-                        files.append(&mut archive_files);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to scan archive {}: {}", file_path.display(), e);
-                    }
-                }
+            let file_path = entry.path().to_path_buf();
+            let item = if is_zip_file(&file_path) {
+                WorkItem::ZipArchive(file_path)
+            } else if is_7z_file(&file_path) {
+                WorkItem::SevenZArchive(file_path)
             } else {
-                // Regular file
-                match hash_file(file_path) {
-                    Ok(scanned) => files.push(scanned),
-                    Err(e) => {
-                        eprintln!("Warning: Failed to hash {}: {}", file_path.display(), e);
-                    }
+                WorkItem::File(file_path)
+            };
+
+            progress.discovered.fetch_add(1, Ordering::Relaxed);
+
+            if sender.send(item).is_err() {
+                break; // Receiver dropped, stop discovery
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Process a single work item
+fn process_work_item(
+    item: WorkItem,
+    skipped: &Arc<std::sync::Mutex<Vec<SkippedFile>>>,
+    zip_count: &Arc<AtomicU64>,
+    sevenz_count: &Arc<AtomicU64>,
+) -> Vec<ScannedFile> {
+    match item {
+        WorkItem::File(path) => match hash_file(&path) {
+            Ok(f) => vec![f],
+            Err(e) => {
+                skipped.lock().unwrap().push(SkippedFile {
+                    path,
+                    reason: e.to_string(),
+                });
+                vec![]
+            }
+        },
+        WorkItem::ZipArchive(path) => {
+            zip_count.fetch_add(1, Ordering::Relaxed);
+            match scan_zip_archive(&path) {
+                Ok(files) => files,
+                Err(e) => {
+                    skipped.lock().unwrap().push(SkippedFile {
+                        path,
+                        reason: format!("ZIP error: {}", e),
+                    });
+                    vec![]
+                }
+            }
+        }
+        WorkItem::SevenZArchive(path) => {
+            sevenz_count.fetch_add(1, Ordering::Relaxed);
+            match scan_7z_archive(&path) {
+                Ok(files) => files,
+                Err(e) => {
+                    skipped.lock().unwrap().push(SkippedFile {
+                        path,
+                        reason: format!("7z error: {}", e),
+                    });
+                    vec![]
                 }
             }
         }
     }
+}
 
-    if archives_scanned > 0 {
-        eprintln!("  Archives scanned: {}", archives_scanned);
-    }
-
-    Ok(files)
+/// Legacy single-threaded scan (for compatibility)
+pub fn scan_directory(path: &Path) -> Result<Vec<ScannedFile>> {
+    let progress = Arc::new(ScanProgress::new());
+    let result = scan_directory_parallel(path, 1, progress)?;
+    Ok(result.files)
 }
 
 /// Check if a file is a ZIP archive based on extension
 fn is_zip_file(path: &Path) -> bool {
     path.extension()
         .map(|ext| ext.to_ascii_lowercase() == "zip")
+        .unwrap_or(false)
+}
+
+/// Check if a file is a 7z archive based on extension
+fn is_7z_file(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_ascii_lowercase() == "7z")
         .unwrap_or(false)
 }
 
@@ -118,6 +308,49 @@ fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
     Ok(files)
 }
 
+/// Scan contents of a 7z archive
+fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
+    // 7z requires extraction - use temp directory
+    let temp_dir = tempfile::tempdir()
+        .with_context(|| "Failed to create temp directory for 7z extraction")?;
+
+    sevenz_rust::decompress_file(archive_path, temp_dir.path())
+        .with_context(|| format!("Failed to extract 7z archive: {}", archive_path.display()))?;
+
+    let mut files = Vec::new();
+
+    for entry in WalkDir::new(temp_dir.path()) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let mut scanned = hash_file(entry.path())?;
+
+            // Convert temp path to virtual archive path
+            let relative = entry
+                .path()
+                .strip_prefix(temp_dir.path())
+                .unwrap_or(entry.path());
+
+            scanned.path = PathBuf::from(format!(
+                "{}#{}",
+                archive_path.display(),
+                relative.display()
+            ));
+
+            // Update filename to just the file part
+            scanned.filename = entry
+                .path()
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            files.push(scanned);
+        }
+    }
+
+    // temp_dir is automatically cleaned up when dropped
+    Ok(files)
+}
+
 /// Hash a single file, computing CRC32, MD5, and SHA1 in a single read
 pub fn hash_file(path: &Path) -> Result<ScannedFile> {
     let file = File::open(path)
@@ -146,7 +379,7 @@ fn hash_reader<R: Read>(reader: &mut R) -> Result<(String, String, String)> {
     let mut md5 = Md5::new();
     let mut sha1 = Sha1::new();
 
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; 65536]; // Larger buffer for better throughput
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
@@ -207,5 +440,13 @@ mod tests {
         assert!(is_zip_file(Path::new("game.ZIP")));
         assert!(!is_zip_file(Path::new("game.adf")));
         assert!(!is_zip_file(Path::new("game")));
+    }
+
+    #[test]
+    fn test_is_7z_file() {
+        assert!(is_7z_file(Path::new("game.7z")));
+        assert!(is_7z_file(Path::new("game.7Z")));
+        assert!(!is_7z_file(Path::new("game.zip")));
+        assert!(!is_7z_file(Path::new("game")));
     }
 }
