@@ -41,6 +41,7 @@ pub struct ScanResult {
     pub skipped: Vec<SkippedFile>,
     pub zip_archives: u64,
     pub sevenz_archives: u64,
+    pub total_bytes: u64,
     pub duration: Duration,
 }
 
@@ -52,6 +53,12 @@ pub struct ScanProgress {
     pub start_time: Instant,
     /// Current file being processed (for verbose output)
     current_file: std::sync::Mutex<Option<String>>,
+    /// Current file's total size in bytes
+    pub current_file_size: AtomicU64,
+    /// Bytes hashed so far in current file
+    pub current_file_bytes: AtomicU64,
+    /// Total bytes hashed across all files
+    pub total_bytes: AtomicU64,
 }
 
 impl ScanProgress {
@@ -62,6 +69,9 @@ impl ScanProgress {
             archives_opened: AtomicU64::new(0),
             start_time: Instant::now(),
             current_file: std::sync::Mutex::new(None),
+            current_file_size: AtomicU64::new(0),
+            current_file_bytes: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
         }
     }
 
@@ -74,16 +84,47 @@ impl ScanProgress {
         }
     }
 
-    /// Set the current file being processed
-    pub fn set_current(&self, path: &Path) {
+    /// Bytes per second throughput
+    pub fn bytes_per_sec(&self) -> f64 {
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            self.total_bytes.load(Ordering::Relaxed) as f64 / elapsed
+        } else {
+            0.0
+        }
+    }
+
+    /// Set the current file being processed (with size)
+    pub fn set_current_with_size(&self, path: &Path, size: u64) {
         if let Ok(mut current) = self.current_file.lock() {
             *current = Some(path.to_string_lossy().to_string());
         }
+        self.current_file_size.store(size, Ordering::Relaxed);
+        self.current_file_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Set the current file being processed
+    pub fn set_current(&self, path: &Path) {
+        self.set_current_with_size(path, 0);
+    }
+
+    /// Add bytes to current file progress
+    pub fn add_bytes(&self, bytes: u64) {
+        self.current_file_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Get the current file being processed
     pub fn get_current(&self) -> Option<String> {
         self.current_file.lock().ok().and_then(|c| c.clone())
+    }
+
+    /// Get current file progress as (bytes_done, total_size)
+    pub fn get_file_progress(&self) -> (u64, u64) {
+        (
+            self.current_file_bytes.load(Ordering::Relaxed),
+            self.current_file_size.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -169,6 +210,7 @@ pub fn scan_directory_parallel(
         skipped: skipped_files,
         zip_archives: zip_count.load(Ordering::Relaxed),
         sevenz_archives: sevenz_count.load(Ordering::Relaxed),
+        total_bytes: progress.total_bytes.load(Ordering::Relaxed),
         duration,
     })
 }
@@ -218,8 +260,7 @@ fn process_work_item(
 ) -> Vec<ScannedFile> {
     match item {
         WorkItem::File(ref path) => {
-            progress.set_current(path);
-            match hash_file(path) {
+            match hash_file_with_progress(path, Some(progress)) {
                 Ok(f) => vec![f],
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -233,7 +274,7 @@ fn process_work_item(
         WorkItem::ZipArchive(ref path) => {
             progress.set_current(path);
             zip_count.fetch_add(1, Ordering::Relaxed);
-            match scan_zip_archive(path) {
+            match scan_zip_archive_with_progress(path, progress) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -247,7 +288,7 @@ fn process_work_item(
         WorkItem::SevenZArchive(ref path) => {
             progress.set_current(path);
             sevenz_count.fetch_add(1, Ordering::Relaxed);
-            match scan_7z_archive(path) {
+            match scan_7z_archive_with_progress(path, progress) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -282,8 +323,8 @@ fn is_7z_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Scan contents of a ZIP archive
-fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
+/// Scan contents of a ZIP archive with progress tracking
+fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>) -> Result<Vec<ScannedFile>> {
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
 
@@ -311,15 +352,16 @@ fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
         let entry_name = entry.name().to_string();
         let entry_size = entry.size();
 
-        // Hash the entry contents
-        let hashes = hash_reader(&mut entry)?;
-
-        // Path format: archive_path#entry_name (so we know where it came from)
+        // Update progress for this entry
         let virtual_path = PathBuf::from(format!(
             "{}#{}",
             archive_path.display(),
             entry_name
         ));
+        progress.set_current_with_size(&virtual_path, entry_size);
+
+        // Hash the entry contents with progress
+        let hashes = hash_reader_with_progress(&mut entry, Some(progress))?;
 
         // For matching purposes, use just the entry filename
         let filename = Path::new(&entry_name)
@@ -341,8 +383,8 @@ fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
     Ok(files)
 }
 
-/// Scan contents of a 7z archive
-fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
+/// Scan contents of a 7z archive with progress tracking
+fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>) -> Result<Vec<ScannedFile>> {
     // Get archive mtime for entries
     let archive_mtime = std::fs::metadata(archive_path)
         .ok()
@@ -362,19 +404,20 @@ fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
     for entry in WalkDir::new(temp_dir.path()) {
         let entry = entry?;
         if entry.file_type().is_file() {
-            let mut scanned = hash_file(entry.path())?;
-
-            // Convert temp path to virtual archive path
+            // Build virtual path for progress display
             let relative = entry
                 .path()
                 .strip_prefix(temp_dir.path())
                 .unwrap_or(entry.path());
-
-            scanned.path = PathBuf::from(format!(
+            let virtual_path = PathBuf::from(format!(
                 "{}#{}",
                 archive_path.display(),
                 relative.display()
             ));
+
+            // Hash with progress tracking
+            let mut scanned = hash_file_with_progress(entry.path(), Some(progress))?;
+            scanned.path = virtual_path;
 
             // Update filename to just the file part
             scanned.filename = entry
@@ -396,12 +439,23 @@ fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
 
 /// Hash a single file, computing CRC32, MD5, and SHA1 in a single read
 pub fn hash_file(path: &Path) -> Result<ScannedFile> {
+    hash_file_with_progress(path, None)
+}
+
+/// Hash a single file with optional progress tracking
+pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>) -> Result<ScannedFile> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open file: {}", path.display()))?;
     let metadata = file.metadata()?;
+    let size = metadata.len();
     let mut reader = BufReader::new(file);
 
-    let (crc32, md5, sha1) = hash_reader(&mut reader)?;
+    // Set up progress tracking if provided
+    if let Some(prog) = progress {
+        prog.set_current_with_size(path, size);
+    }
+
+    let (crc32, md5, sha1) = hash_reader_with_progress(&mut reader, progress)?;
 
     // Get mtime as Unix timestamp
     let mtime = metadata
@@ -416,7 +470,7 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
-        size: metadata.len(),
+        size,
         mtime,
         crc32,
         md5,
@@ -424,8 +478,8 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
     })
 }
 
-/// Hash content from a reader, returning (crc32, md5, sha1)
-fn hash_reader<R: Read>(reader: &mut R) -> Result<(String, String, String)> {
+/// Hash content from a reader with optional progress tracking
+fn hash_reader_with_progress<R: Read>(reader: &mut R, progress: Option<&Arc<ScanProgress>>) -> Result<(String, String, String)> {
     let mut crc = Crc32Hasher::new();
     let mut md5 = Md5::new();
     let mut sha1 = Sha1::new();
@@ -440,6 +494,11 @@ fn hash_reader<R: Read>(reader: &mut R) -> Result<(String, String, String)> {
         crc.update(&buffer[..bytes_read]);
         md5.update(&buffer[..bytes_read]);
         sha1.update(&buffer[..bytes_read]);
+
+        // Update progress if tracking
+        if let Some(prog) = progress {
+            prog.add_bytes(bytes_read as u64);
+        }
     }
 
     Ok((

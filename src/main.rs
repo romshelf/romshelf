@@ -752,26 +752,40 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
         loop {
             let discovered = progress_display.discovered.load(Ordering::Relaxed);
             let processed = progress_display.processed.load(Ordering::Relaxed);
-            let rate = progress_display.files_per_sec();
+            let bytes_sec = progress_display.bytes_per_sec();
+            let (file_bytes, file_size) = progress_display.get_file_progress();
 
             if verbose {
-                // Verbose mode: show current file
+                // Verbose mode: show current file with byte progress
                 let current = progress_display.get_current().unwrap_or_default();
-                // Truncate filename for display (show last 50 chars)
-                let display_name = if current.len() > 50 {
-                    format!("...{}", &current[current.len()-47..])
+                // Truncate filename for display (show last 40 chars to make room for progress)
+                let display_name = if current.len() > 40 {
+                    format!("...{}", &current[current.len()-37..])
                 } else {
                     current
                 };
+
+                // Show file progress if we have size info (cap at 100% for display)
+                let file_progress = if file_size > 0 {
+                    let pct = ((file_bytes as f64 / file_size as f64) * 100.0).min(100.0);
+                    format!(" {:>3.0}%", pct)
+                } else {
+                    String::new()
+                };
+
                 eprint!(
-                    "\r  [{:>6}/{:>6}] {:>6.0}/s  {}{}",
-                    processed, discovered, rate, display_name,
-                    " ".repeat(50usize.saturating_sub(display_name.len())) // Clear trailing chars
+                    "\r  [{:>6}/{:>6}] {:>8}/s  {}{}{}",
+                    processed, discovered,
+                    format_bytes_short(bytes_sec as i64),
+                    display_name,
+                    file_progress,
+                    " ".repeat(20) // Clear trailing chars
                 );
             } else {
                 eprint!(
-                    "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>6.0} files/sec  ",
-                    discovered, processed, rate
+                    "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>8}/s  ",
+                    discovered, processed,
+                    format_bytes_short(bytes_sec as i64)
                 );
             }
 
@@ -852,14 +866,15 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
     }
 
     // Print summary
-    let rate = if result.duration.as_secs_f32() > 0.0 {
-        result.files.len() as f32 / result.duration.as_secs_f32()
+    let bytes_per_sec = if result.duration.as_secs_f64() > 0.0 {
+        result.total_bytes as f64 / result.duration.as_secs_f64()
     } else {
-        result.files.len() as f32
+        result.total_bytes as f64
     };
 
     println!("\nScan complete in {:.1}s", result.duration.as_secs_f32());
     println!("  Files:      {:>6}", result.files.len());
+    println!("  Data:       {:>6}", format_bytes(result.total_bytes as i64));
 
     if existing_count > 0 {
         println!("  New:        {:>6}", new_files);
@@ -882,7 +897,7 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
         println!("  Skipped:    {:>6}", result.skipped.len());
     }
 
-    println!("  Speed:      {:>6.0} files/sec", rate);
+    println!("  Speed:      {:>6}/s", format_bytes(bytes_per_sec as i64));
 
     // Show skipped files if any
     if !result.skipped.is_empty() {
@@ -1920,6 +1935,23 @@ fn format_bytes(bytes: i64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Format bytes as short string (for progress display)
+fn format_bytes_short(bytes: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = KB * 1024;
+    const GB: i64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1}G", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}M", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0}K", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
     }
 }
 
