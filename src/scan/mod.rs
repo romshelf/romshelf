@@ -50,6 +50,8 @@ pub struct ScanProgress {
     pub processed: AtomicU64,
     pub archives_opened: AtomicU64,
     pub start_time: Instant,
+    /// Current file being processed (for verbose output)
+    current_file: std::sync::Mutex<Option<String>>,
 }
 
 impl ScanProgress {
@@ -59,6 +61,7 @@ impl ScanProgress {
             processed: AtomicU64::new(0),
             archives_opened: AtomicU64::new(0),
             start_time: Instant::now(),
+            current_file: std::sync::Mutex::new(None),
         }
     }
 
@@ -69,6 +72,18 @@ impl ScanProgress {
         } else {
             0.0
         }
+    }
+
+    /// Set the current file being processed
+    pub fn set_current(&self, path: &Path) {
+        if let Ok(mut current) = self.current_file.lock() {
+            *current = Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    /// Get the current file being processed
+    pub fn get_current(&self) -> Option<String> {
+        self.current_file.lock().ok().and_then(|c| c.clone())
     }
 }
 
@@ -130,6 +145,7 @@ pub fn scan_directory_parallel(
                     &skipped_clone,
                     &zip_count_clone,
                     &sevenz_count_clone,
+                    &progress_clone,
                 );
                 progress_clone.processed.fetch_add(1, Ordering::Relaxed);
                 result
@@ -198,38 +214,44 @@ fn process_work_item(
     skipped: &Arc<std::sync::Mutex<Vec<SkippedFile>>>,
     zip_count: &Arc<AtomicU64>,
     sevenz_count: &Arc<AtomicU64>,
+    progress: &Arc<ScanProgress>,
 ) -> Vec<ScannedFile> {
     match item {
-        WorkItem::File(path) => match hash_file(&path) {
-            Ok(f) => vec![f],
-            Err(e) => {
-                skipped.lock().unwrap().push(SkippedFile {
-                    path,
-                    reason: e.to_string(),
-                });
-                vec![]
+        WorkItem::File(ref path) => {
+            progress.set_current(path);
+            match hash_file(path) {
+                Ok(f) => vec![f],
+                Err(e) => {
+                    skipped.lock().unwrap().push(SkippedFile {
+                        path: path.clone(),
+                        reason: e.to_string(),
+                    });
+                    vec![]
+                }
             }
-        },
-        WorkItem::ZipArchive(path) => {
+        }
+        WorkItem::ZipArchive(ref path) => {
+            progress.set_current(path);
             zip_count.fetch_add(1, Ordering::Relaxed);
-            match scan_zip_archive(&path) {
+            match scan_zip_archive(path) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
-                        path,
+                        path: path.clone(),
                         reason: format!("ZIP error: {}", e),
                     });
                     vec![]
                 }
             }
         }
-        WorkItem::SevenZArchive(path) => {
+        WorkItem::SevenZArchive(ref path) => {
+            progress.set_current(path);
             sevenz_count.fetch_add(1, Ordering::Relaxed);
-            match scan_7z_archive(&path) {
+            match scan_7z_archive(path) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
-                        path,
+                        path: path.clone(),
                         reason: format!("7z error: {}", e),
                     });
                     vec![]

@@ -87,6 +87,7 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
     let mut current_set: Option<DatSet> = None;
     let mut in_header = false;
     let mut current_text_target: Option<&str> = None;
+    let mut header_description: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -97,6 +98,7 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                 match tag_name.as_str() {
                     "header" => in_header = true,
                     "name" if in_header => current_text_target = Some("name"),
+                    "description" if in_header => current_text_target = Some("description"),
                     "version" if in_header => current_text_target = Some("version"),
                     "game" | "machine" | "software" => {
                         // Start a new set - get name attribute
@@ -145,6 +147,7 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                     let text = e.unescape().unwrap_or_default().to_string();
                     match target {
                         "name" => dat.name = text,
+                        "description" => header_description = Some(text),
                         "version" => dat.version = Some(text),
                         _ => {}
                     }
@@ -171,6 +174,14 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
             _ => {}
         }
         buf.clear();
+    }
+
+    // Prefer description over name for MAME Software Lists (which have cryptic names like "a2600")
+    // but only if description is more informative (longer than the name)
+    if let Some(desc) = header_description {
+        if desc.len() > dat.name.len() {
+            dat.name = desc;
+        }
     }
 
     Ok(dat)

@@ -20,6 +20,10 @@ type MatchedFile = (PathBuf, String, String, String, Option<String>, Option<Stri
 #[command(name = "bitshelf")]
 #[command(about = "ROM collection manager - DAT-driven verification and organisation")]
 struct Cli {
+    /// Show verbose progress (current file, archives being opened, etc.)
+    #[arg(long, short = 'v', global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -48,9 +52,9 @@ enum Commands {
     },
     /// Organise ROMs into a structured directory
     Organise {
-        /// Target directory for organised ROMs
-        #[arg(long)]
-        target: PathBuf,
+        /// Target directory for organised ROMs (not used with --rename-only)
+        #[arg(long, required_unless_present = "rename_only")]
+        target: Option<PathBuf>,
 
         /// Dry run - show what would be done without making changes
         #[arg(long)]
@@ -67,6 +71,10 @@ enum Commands {
         /// Create one ZIP per DAT instead of per set
         #[arg(long)]
         zip_per_dat: bool,
+
+        /// Only rename misnamed files in-place (don't reorganise)
+        #[arg(long)]
+        rename_only: bool,
     },
     /// Show collection statistics
     Stats,
@@ -78,12 +86,6 @@ enum Commands {
         #[arg(long)]
         details: bool,
     },
-    /// Rename misnamed files to match DAT entries
-    Rename {
-        /// Dry run - show what would be renamed without making changes
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -92,14 +94,44 @@ enum DatCommands {
     Import {
         /// Path to DAT file
         path: PathBuf,
+
+        /// Category for the DAT (e.g., "MAME/Arcade")
+        #[arg(long)]
+        category: Option<String>,
     },
     /// Import all DAT files from a directory (recursive)
     ImportDir {
         /// Directory containing DAT files
         path: PathBuf,
+
+        /// Category prefix (e.g., "TOSEC" to create TOSEC/Manufacturer/System/...)
+        #[arg(long)]
+        prefix: Option<String>,
     },
     /// List imported DATs
-    List,
+    List {
+        /// Filter by category (substring match)
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Search by name (substring match)
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Show detailed information about a DAT
+    Info {
+        /// DAT ID or name (partial match)
+        dat: String,
+    },
+    /// Remove a DAT and all its entries
+    Remove {
+        /// DAT ID or name (partial match)
+        dat: String,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -109,21 +141,28 @@ fn main() -> Result<()> {
     let db_path = get_db_path()?;
     let conn = db::init_db(&db_path)?;
 
+    let verbose = cli.verbose;
+
     match cli.command {
         Commands::Dat { command } => match command {
-            DatCommands::Import { path } => cmd_dat_import(&conn, &path),
-            DatCommands::ImportDir { path } => cmd_dat_import_dir(&conn, &path),
-            DatCommands::List => cmd_dat_list(&conn),
+            DatCommands::Import { path, category } => cmd_dat_import(&conn, &path, category.as_deref()),
+            DatCommands::ImportDir { path, prefix } => cmd_dat_import_dir(&conn, &path, prefix.as_deref(), verbose),
+            DatCommands::List { category, search } => cmd_dat_list(&conn, category.as_deref(), search.as_deref()),
+            DatCommands::Info { dat } => cmd_dat_info(&conn, &dat),
+            DatCommands::Remove { dat, yes } => cmd_dat_remove(&conn, &dat, yes),
         },
-        Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads),
+        Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads, verbose),
         Commands::Verify { issues } => cmd_verify(&conn, issues),
-        Commands::Organise { target, dry_run, copy, loose, zip_per_dat } => {
-            cmd_organise(&conn, &target, dry_run, copy, loose, zip_per_dat)
+        Commands::Organise { target, dry_run, copy, loose, zip_per_dat, rename_only } => {
+            if rename_only {
+                cmd_rename_in_place(&conn, dry_run)
+            } else {
+                cmd_organise(&conn, target.as_ref().unwrap(), dry_run, copy, loose, zip_per_dat)
+            }
         }
         Commands::Stats => cmd_stats(&conn),
         Commands::Health => cmd_health(&conn),
         Commands::Duplicates { details } => cmd_duplicates(&conn, details),
-        Commands::Rename { dry_run } => cmd_rename(&conn, dry_run),
     }
 }
 
@@ -141,8 +180,8 @@ enum ImportResult {
     Failed { path: PathBuf, error: String },
 }
 
-fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
-    match import_single_dat(conn, path, None)? {
+fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf, category: Option<&str>) -> Result<()> {
+    match import_single_dat(conn, path, category)? {
         ImportResult::Imported { name, version, entries } => {
             println!("Imported: {}", name);
             if let Some(v) = version {
@@ -160,13 +199,13 @@ fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()> {
+fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&str>, verbose: bool) -> Result<()> {
     use walkdir::WalkDir;
 
     eprintln!("Scanning for DAT files in {}...", path.display());
 
     // Canonicalize the base path for reliable relative path calculation
-    let base_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let base_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     let dat_files: Vec<PathBuf> = WalkDir::new(path)
         .follow_links(true)
@@ -176,7 +215,9 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
             e.file_type().is_file()
                 && e.path()
                     .extension()
-                    .map(|ext| ext.eq_ignore_ascii_case("dat"))
+                    .map(|ext| {
+                        ext.eq_ignore_ascii_case("dat") || ext.eq_ignore_ascii_case("xml")
+                    })
                     .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
@@ -189,14 +230,34 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
     let mut failed = 0;
 
     for (i, dat_path) in dat_files.iter().enumerate() {
-        eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
+        if verbose {
+            // Show full DAT path in verbose mode
+            let display_name = dat_path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            eprint!("\r  [{:>4}/{:>4}] {}{}",
+                i + 1, dat_files.len(), display_name,
+                " ".repeat(60usize.saturating_sub(display_name.len()))
+            );
+        } else {
+            eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
+        }
 
         // Compute category from relative path (parent directory of DAT file)
-        // Include the base folder name as the root of the category
-        let base_name = base_path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
+        // Use prefix if provided, otherwise use the base folder name
+        let category_root = prefix
+            .map(|p| p.to_string())
+            .or_else(|| base_path.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_default();
 
+        // Try TOSEC filename parsing first - this gives us proper manufacturer/platform paths
+        let tosec_category = dat_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(tosec::parse_tosec_category)
+            .map(|cat| format!("{}/{}", category_root, cat));
+
+        // Fall back to directory-based category if TOSEC parsing didn't work
         let dir_category = dat_path
             .canonicalize()
             .ok()
@@ -205,19 +266,15 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
             .map(|rel_path| {
                 let rel_str = rel_path.to_string_lossy();
                 if rel_str.is_empty() {
-                    base_name.clone()
+                    category_root.clone()
                 } else {
-                    format!("{}/{}", base_name, rel_str)
+                    format!("{}/{}", category_root, rel_str)
                 }
             })
             .filter(|s| !s.is_empty());
 
-        // If no directory-based category, try parsing from TOSEC filename
-        let category = dir_category.or_else(|| {
-            dat_path.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(tosec::parse_tosec_category)
-        });
+        // Prefer TOSEC filename parsing, then directory structure
+        let category = tosec_category.or(dir_category);
 
         match import_single_dat(conn, dat_path, category.as_deref()) {
             Ok(ImportResult::Imported { .. }) => imported += 1,
@@ -380,45 +437,286 @@ fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Opti
     })
 }
 
-fn cmd_dat_list(conn: &rusqlite::Connection) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT d.id, d.name, dv.version, dv.entry_count, dv.loaded_at
+fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, search_filter: Option<&str>) -> Result<()> {
+    // Build query with optional filters
+    let mut sql = String::from(
+        "SELECT d.id, d.name, d.category, dv.version, dv.entry_count, dv.loaded_at
          FROM dats d
          JOIN dat_versions dv ON d.id = dv.dat_id
-         ORDER BY dv.loaded_at DESC",
-    )?;
+         WHERE 1=1"
+    );
 
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
+    if category_filter.is_some() {
+        sql.push_str(" AND d.category LIKE '%' || ?1 || '%'");
+    }
 
-    let mut count = 0;
-    for row in rows {
-        let (id, name, version, entry_count, loaded_at) = row?;
+    if search_filter.is_some() {
+        let param_num = if category_filter.is_some() { "?2" } else { "?1" };
+        sql.push_str(&format!(" AND d.name LIKE '%' || {} || '%'", param_num));
+    }
+
+    sql.push_str(" ORDER BY d.category, d.name");
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows: Vec<(i64, String, Option<String>, Option<String>, i64, String)> = match (category_filter, search_filter) {
+        (Some(cat), Some(search)) => {
+            stmt.query_map([cat, search], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?.filter_map(|r| r.ok()).collect()
+        }
+        (Some(cat), None) => {
+            stmt.query_map([cat], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?.filter_map(|r| r.ok()).collect()
+        }
+        (None, Some(search)) => {
+            stmt.query_map([search], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?.filter_map(|r| r.ok()).collect()
+        }
+        (None, None) => {
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            })?.filter_map(|r| r.ok()).collect()
+        }
+    };
+
+    let count = rows.len();
+
+    for (id, name, category, version, entry_count, loaded_at) in rows {
         println!("[{}] {}", id, name);
+        if let Some(cat) = category {
+            println!("    Category: {}", cat);
+        }
         if let Some(v) = version {
             println!("    Version: {}", v);
         }
         println!("    Entries: {}", entry_count);
         println!("    Loaded: {}", loaded_at);
         println!();
-        count += 1;
     }
 
     if count == 0 {
-        println!("No DATs imported yet. Use `bitshelf dat import <path>` to import one.");
+        if category_filter.is_some() || search_filter.is_some() {
+            println!("No DATs match the specified filters.");
+        } else {
+            println!("No DATs imported yet. Use `bitshelf dat import <path>` to import one.");
+        }
+    } else {
+        println!("Total: {} DATs", count);
     }
 
     Ok(())
 }
 
-fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>) -> Result<()> {
+/// Show detailed information about a DAT
+fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
+    // Try to find by ID first, then by name
+    let dat_id: Option<i64> = dat_ref.parse().ok().and_then(|id: i64| {
+        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0)).ok()
+    });
+
+    let dat_id = match dat_id {
+        Some(id) => id,
+        None => {
+            // Search by name (case-insensitive substring match)
+            let matches: Vec<(i64, String)> = conn
+                .prepare("SELECT id, name FROM dats WHERE name LIKE '%' || ?1 || '%'")?
+                .query_map([dat_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            match matches.len() {
+                0 => {
+                    println!("No DAT found matching '{}'", dat_ref);
+                    return Ok(());
+                }
+                1 => matches[0].0,
+                _ => {
+                    println!("Multiple DATs match '{}'. Please be more specific:", dat_ref);
+                    for (id, name) in &matches {
+                        println!("  [{}] {}", id, name);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    // Get DAT details
+    let (name, format, file_path, category, file_size, file_mtime): (String, String, String, Option<String>, Option<i64>, Option<i64>) =
+        conn.query_row(
+            "SELECT name, format, file_path, category, file_size, file_mtime FROM dats WHERE id = ?1",
+            [dat_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )?;
+
+    // Get version details
+    let (version_id, version, loaded_at, entry_count): (i64, Option<String>, String, i64) =
+        conn.query_row(
+            "SELECT id, version, loaded_at, entry_count FROM dat_versions WHERE dat_id = ?1",
+            [dat_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+    // Get set count
+    let set_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sets WHERE dat_version_id = ?1",
+        [version_id],
+        |row| row.get(0),
+    )?;
+
+    // Get match count (how many entries have matching files)
+    let matched_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT de.id) FROM dat_entries de
+         JOIN files f ON (f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size))
+         WHERE de.dat_version_id = ?1",
+        [version_id],
+        |row| row.get(0),
+    )?;
+
+    println!("DAT Information");
+    println!("===============");
+    println!("  ID:         {}", dat_id);
+    println!("  Name:       {}", name);
+    if let Some(v) = version {
+        println!("  Version:    {}", v);
+    }
+    if let Some(cat) = category {
+        println!("  Category:   {}", cat);
+    }
+    println!("  Format:     {}", format);
+    println!("  File:       {}", file_path);
+    if let Some(size) = file_size {
+        println!("  File size:  {}", format_bytes(size));
+    }
+    if let Some(mtime) = file_mtime {
+        let dt = chrono::DateTime::from_timestamp(mtime, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| mtime.to_string());
+        println!("  File mtime: {}", dt);
+    }
+    println!("  Loaded:     {}", loaded_at);
+    println!();
+    println!("Contents");
+    println!("--------");
+    println!("  Sets:       {:>8}", set_count);
+    println!("  Entries:    {:>8}", entry_count);
+    println!();
+    println!("Collection Status");
+    println!("-----------------");
+    let pct = if entry_count > 0 {
+        (matched_count as f64 / entry_count as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!("  Matched:    {:>8} / {} ({:.1}%)", matched_count, entry_count, pct);
+    println!("  Missing:    {:>8}", entry_count - matched_count);
+
+    Ok(())
+}
+
+/// Remove a DAT and all its entries
+fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool) -> Result<()> {
+    // Try to find by ID first, then by name
+    let dat_id: Option<i64> = dat_ref.parse().ok().and_then(|id: i64| {
+        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0)).ok()
+    });
+
+    let dat_id = match dat_id {
+        Some(id) => id,
+        None => {
+            // Search by name (case-insensitive substring match)
+            let matches: Vec<(i64, String)> = conn
+                .prepare("SELECT id, name FROM dats WHERE name LIKE '%' || ?1 || '%'")?
+                .query_map([dat_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            match matches.len() {
+                0 => {
+                    println!("No DAT found matching '{}'", dat_ref);
+                    return Ok(());
+                }
+                1 => matches[0].0,
+                _ => {
+                    println!("Multiple DATs match '{}'. Please be more specific:", dat_ref);
+                    for (id, name) in &matches {
+                        println!("  [{}] {}", id, name);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    // Get DAT details for confirmation
+    let (name, entry_count): (String, i64) = conn.query_row(
+        "SELECT d.name, dv.entry_count FROM dats d
+         JOIN dat_versions dv ON d.id = dv.dat_id
+         WHERE d.id = ?1",
+        [dat_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+
+    // Confirm deletion unless -y flag was passed
+    if !skip_confirm {
+        println!("About to remove:");
+        println!("  [{}] {} ({} entries)", dat_id, name, entry_count);
+        println!();
+        eprint!("Are you sure? [y/N] ");
+
+        use std::io::{self, Write};
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Get version ID for cascade deletion
+    let version_id: i64 = conn.query_row(
+        "SELECT id FROM dat_versions WHERE dat_id = ?1",
+        [dat_id],
+        |row| row.get(0),
+    )?;
+
+    // Delete in order: matches -> dat_entries -> sets -> dat_versions -> dats
+    // Note: matches reference dat_entries, so delete them first
+    let matches_deleted: usize = conn.execute(
+        "DELETE FROM matches WHERE dat_entry_id IN (SELECT id FROM dat_entries WHERE dat_version_id = ?1)",
+        [version_id],
+    )?;
+
+    let entries_deleted: usize = conn.execute(
+        "DELETE FROM dat_entries WHERE dat_version_id = ?1",
+        [version_id],
+    )?;
+
+    let sets_deleted: usize = conn.execute(
+        "DELETE FROM sets WHERE dat_version_id = ?1",
+        [version_id],
+    )?;
+
+    conn.execute("DELETE FROM dat_versions WHERE id = ?1", [version_id])?;
+    conn.execute("DELETE FROM dats WHERE id = ?1", [dat_id])?;
+
+    println!("Removed: {}", name);
+    println!("  Entries deleted: {}", entries_deleted);
+    println!("  Sets deleted:    {}", sets_deleted);
+    if matches_deleted > 0 {
+        println!("  Matches deleted: {}", matches_deleted);
+    }
+
+    Ok(())
+}
+
+fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, verbose: bool) -> Result<()> {
     let thread_count = threads.unwrap_or_else(num_cpus::get).max(1);
 
     // Load existing files from database for incremental scan
@@ -456,10 +754,26 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>) ->
             let processed = progress_display.processed.load(Ordering::Relaxed);
             let rate = progress_display.files_per_sec();
 
-            eprint!(
-                "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>6.0} files/sec  ",
-                discovered, processed, rate
-            );
+            if verbose {
+                // Verbose mode: show current file
+                let current = progress_display.get_current().unwrap_or_default();
+                // Truncate filename for display (show last 50 chars)
+                let display_name = if current.len() > 50 {
+                    format!("...{}", &current[current.len()-47..])
+                } else {
+                    current
+                };
+                eprint!(
+                    "\r  [{:>6}/{:>6}] {:>6.0}/s  {}{}",
+                    processed, discovered, rate, display_name,
+                    " ".repeat(50usize.saturating_sub(display_name.len())) // Clear trailing chars
+                );
+            } else {
+                eprint!(
+                    "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>6.0} files/sec  ",
+                    discovered, processed, rate
+                );
+            }
 
             // Check if we're done (processed >= discovered and discovered > 0)
             if processed >= discovered && discovered > 0 {
@@ -1609,7 +1923,8 @@ fn format_bytes(bytes: i64) -> String {
     }
 }
 
-fn cmd_rename(conn: &rusqlite::Connection, dry_run: bool) -> Result<()> {
+/// Rename misnamed files in-place (without restructuring)
+fn cmd_rename_in_place(conn: &rusqlite::Connection, dry_run: bool) -> Result<()> {
     // Find misnamed files: files that match a DAT entry by hash but have wrong filename
     // Only consider loose files (not inside archives - those have # in path)
     let mut stmt = conn.prepare(
