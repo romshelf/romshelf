@@ -505,7 +505,7 @@ pub fn parse_tosec_category(filename: &str) -> Option<String> {
     for (prefix, category) in TOSEC_PREFIX_MAP.entries() {
         if name.starts_with(*prefix) {
             // Check if this is a longer match than our current best
-            if best_match.map_or(true, |(best_prefix, _)| prefix.len() > best_prefix.len()) {
+            if best_match.is_none_or(|(best_prefix, _)| prefix.len() > best_prefix.len()) {
                 // Verify it's a complete prefix (followed by " - " or end of string)
                 let rest = &name[prefix.len()..];
                 if rest.is_empty() || rest.starts_with(" - ") {

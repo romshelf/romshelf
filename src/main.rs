@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -11,6 +11,10 @@ use bitshelf::db;
 use bitshelf::scan::{self, ScanProgress};
 use bitshelf::tosec;
 use bitshelf::verify;
+
+/// A matched file ready for organisation
+/// (source_path, filename, rom_name, dat_name, set_name, category)
+type MatchedFile = (PathBuf, String, String, String, Option<String>, Option<String>);
 
 #[derive(Parser)]
 #[command(name = "bitshelf")]
@@ -172,7 +176,7 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
             e.file_type().is_file()
                 && e.path()
                     .extension()
-                    .map(|ext| ext.to_ascii_lowercase() == "dat")
+                    .map(|ext| ext.eq_ignore_ascii_case("dat"))
                     .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
@@ -414,7 +418,7 @@ fn cmd_dat_list(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
-fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>) -> Result<()> {
+fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>) -> Result<()> {
     let thread_count = threads.unwrap_or_else(num_cpus::get).max(1);
 
     // Load existing files from database for incremental scan
@@ -699,7 +703,7 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
 
 fn cmd_organise(
     conn: &rusqlite::Connection,
-    target: &PathBuf,
+    target: &Path,
     dry_run: bool,
     copy: bool,
     loose: bool,
@@ -717,8 +721,7 @@ fn cmd_organise(
          LEFT JOIN sets s ON de.set_id = s.id",
     )?;
 
-    // (source_path, filename, rom_name, dat_name, set_name, category)
-    let matches: Vec<(PathBuf, String, String, String, Option<String>, Option<String>)> = stmt
+    let matches: Vec<MatchedFile> = stmt
         .query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -765,8 +768,8 @@ fn cmd_organise(
 
 /// Organise files as loose files
 fn organise_loose(
-    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
-    target: &PathBuf,
+    matches: &[MatchedFile],
+    target: &Path,
     dry_run: bool,
     copy: bool,
 ) -> Result<()> {
@@ -807,7 +810,7 @@ fn organise_loose(
         let base_dir = if let Some(cat) = category {
             target.join(cat)
         } else {
-            target.clone()
+            target.to_path_buf()
         };
         let target_dir = if let Some(set) = set_name {
             base_dir.join(sanitise_path(set))
@@ -871,8 +874,8 @@ fn organise_loose(
 
 /// Organise files into ZIP archives, one per set
 fn organise_zip_per_set(
-    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
-    target: &PathBuf,
+    matches: &[MatchedFile],
+    target: &Path,
     dry_run: bool,
     copy: bool,
 ) -> Result<()> {
@@ -897,7 +900,7 @@ fn organise_zip_per_set(
     for ((category, set_name), files) in &sets {
         // Use category path for directory structure
         let target_dir = target.join(category);
-        let archive_name = format!("{}.zip", sanitise_path(&set_name));
+        let archive_name = format!("{}.zip", sanitise_path(set_name));
         let archive_path = target_dir.join(&archive_name);
 
         if dry_run {
@@ -942,14 +945,15 @@ fn organise_zip_per_set(
 
 /// Organise files into ZIP archives, one per DAT
 fn organise_zip_per_dat(
-    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
-    target: &PathBuf,
+    matches: &[MatchedFile],
+    target: &Path,
     dry_run: bool,
     copy: bool,
 ) -> Result<()> {
     // Group files by (category, dat_name)
     // category is the path like "CPC/Games/[DSK]"
-    let mut dats: std::collections::HashMap<(String, String), Vec<(PathBuf, String, Option<String>)>> =
+    type DatFileEntry = (PathBuf, String, Option<String>);
+    let mut dats: std::collections::HashMap<(String, String), Vec<DatFileEntry>> =
         std::collections::HashMap::new();
 
     for (source_path, _filename, rom_name, dat_name, set_name, category) in matches {
@@ -1453,7 +1457,7 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
         let display_name = if path.is_empty() {
             "(root)".to_string()
         } else {
-            path.split('/').last().unwrap_or(path).to_string()
+            path.rsplit('/').next().unwrap_or(path).to_string()
         };
 
         let pct = if *total > 0 {

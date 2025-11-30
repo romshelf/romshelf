@@ -249,14 +249,14 @@ pub fn scan_directory(path: &Path) -> Result<Vec<ScannedFile>> {
 /// Check if a file is a ZIP archive based on extension
 fn is_zip_file(path: &Path) -> bool {
     path.extension()
-        .map(|ext| ext.to_ascii_lowercase() == "zip")
+        .map(|ext| ext.eq_ignore_ascii_case("zip"))
         .unwrap_or(false)
 }
 
 /// Check if a file is a 7z archive based on extension
 fn is_7z_file(path: &Path) -> bool {
     path.extension()
-        .map(|ext| ext.to_ascii_lowercase() == "7z")
+        .map(|ext| ext.eq_ignore_ascii_case("7z"))
         .unwrap_or(false)
 }
 
