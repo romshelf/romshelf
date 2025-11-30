@@ -55,9 +55,31 @@ enum Commands {
         /// Copy files instead of moving them
         #[arg(long)]
         copy: bool,
+
+        /// Output as loose files instead of ZIP archives
+        #[arg(long)]
+        loose: bool,
+
+        /// Create one ZIP per DAT instead of per set
+        #[arg(long)]
+        zip_per_dat: bool,
     },
     /// Show collection statistics
     Stats,
+    /// Show collection health report
+    Health,
+    /// Find duplicate files in the collection
+    Duplicates {
+        /// Show all duplicate file paths (not just summary)
+        #[arg(long)]
+        details: bool,
+    },
+    /// Rename misnamed files to match DAT entries
+    Rename {
+        /// Dry run - show what would be renamed without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,8 +113,13 @@ fn main() -> Result<()> {
         },
         Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads),
         Commands::Verify { issues } => cmd_verify(&conn, issues),
-        Commands::Organise { target, dry_run, copy } => cmd_organise(&conn, &target, dry_run, copy),
+        Commands::Organise { target, dry_run, copy, loose, zip_per_dat } => {
+            cmd_organise(&conn, &target, dry_run, copy, loose, zip_per_dat)
+        }
         Commands::Stats => cmd_stats(&conn),
+        Commands::Health => cmd_health(&conn),
+        Commands::Duplicates { details } => cmd_duplicates(&conn, details),
+        Commands::Rename { dry_run } => cmd_rename(&conn, dry_run),
     }
 }
 
@@ -161,12 +188,24 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
         eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
 
         // Compute category from relative path (parent directory of DAT file)
+        // Include the base folder name as the root of the category
+        let base_name = base_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         let dir_category = dat_path
             .canonicalize()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
             .and_then(|parent| parent.strip_prefix(&base_path).ok().map(|p| p.to_path_buf()))
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|rel_path| {
+                let rel_str = rel_path.to_string_lossy();
+                if rel_str.is_empty() {
+                    base_name.clone()
+                } else {
+                    format!("{}/{}", base_name, rel_str)
+                }
+            })
             .filter(|s| !s.is_empty());
 
         // If no directory-based category, try parsing from TOSEC filename
@@ -202,7 +241,43 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &PathBuf) -> Result<()>
 }
 
 fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Option<&str>) -> Result<ImportResult> {
-    // Hash the DAT file first for duplicate detection
+    // Get file metadata for mtime/size check
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(ImportResult::Failed {
+                path: path.clone(),
+                error: e.to_string(),
+            });
+        }
+    };
+
+    let file_size = metadata.len() as i64;
+    let file_mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
+    let path_str = path.to_string_lossy().to_string();
+
+    // Check if we already have this DAT and it hasn't changed (same path, size, mtime)
+    let existing: Option<(String, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT name, file_size, file_mtime FROM dats WHERE file_path = ?1",
+            [&path_str],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+
+    if let Some((name, existing_size, existing_mtime)) = existing {
+        if existing_size == file_size && existing_mtime == file_mtime {
+            // File unchanged - skip re-import
+            return Ok(ImportResult::Duplicate { name });
+        }
+    }
+
+    // Hash the DAT file for duplicate detection
     let file_sha1 = match dat::hash_dat_file(path) {
         Ok(hash) => hash,
         Err(e) => {
@@ -213,7 +288,7 @@ fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Opti
         }
     };
 
-    // Check if this exact DAT already exists
+    // Check if this exact DAT already exists (by hash)
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM dats WHERE file_sha1 = ?1",
@@ -247,12 +322,14 @@ fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Opti
 
     // Insert DAT record
     conn.execute(
-        "INSERT INTO dats (name, format, file_path, file_sha1, category) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO dats (name, format, file_path, file_sha1, file_size, file_mtime, category) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             &parsed.name,
             "logiqx",
-            &path.to_string_lossy().to_string(),
+            &path_str,
             &file_sha1,
+            file_size,
+            file_mtime,
             category
         ],
     )?;
@@ -340,7 +417,30 @@ fn cmd_dat_list(conn: &rusqlite::Connection) -> Result<()> {
 fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>) -> Result<()> {
     let thread_count = threads.unwrap_or_else(num_cpus::get).max(1);
 
-    eprintln!("Scanning {} with {} threads...", path.display(), thread_count);
+    // Load existing files from database for incremental scan
+    let existing_files: std::collections::HashMap<String, (i64, Option<i64>)> = {
+        let mut stmt = conn.prepare("SELECT path, size, mtime FROM files")?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    let existing_count = existing_files.len();
+    if existing_count > 0 {
+        eprintln!(
+            "Scanning {} with {} threads ({} files in database)...",
+            path.display(),
+            thread_count,
+            existing_count
+        );
+    } else {
+        eprintln!("Scanning {} with {} threads...", path.display(), thread_count);
+    }
 
     let progress = Arc::new(ScanProgress::new());
     let progress_display = Arc::clone(&progress);
@@ -379,23 +479,58 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>)
     // Wait for progress display to finish
     let _ = display_handle.join();
 
+    // Track paths we've seen (for detecting missing files)
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Store scanned files in database
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "INSERT OR REPLACE INTO files (path, filename, size, crc32, md5, sha1, scanned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO files (path, filename, size, mtime, crc32, md5, sha1, scanned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
 
+    let mut new_files = 0;
+    let mut updated_files = 0;
+    let mut unchanged_files = 0;
+
     for file in &result.files {
+        let path_str = file.path.to_string_lossy().to_string();
+        seen_paths.insert(path_str.clone());
+
+        // Check if file is unchanged (same size and mtime)
+        if let Some(&(existing_size, existing_mtime)) = existing_files.get(&path_str) {
+            if existing_size == file.size as i64
+                && existing_mtime == file.mtime
+            {
+                // File unchanged - skip updating (but track it as seen)
+                unchanged_files += 1;
+                continue;
+            }
+            updated_files += 1;
+        } else {
+            new_files += 1;
+        }
+
         stmt.execute(rusqlite::params![
-            file.path.to_string_lossy().to_string(),
+            path_str,
             file.filename,
             file.size as i64,
+            file.mtime,
             file.crc32,
             file.md5,
             file.sha1,
             now
         ])?;
+    }
+
+    // Handle missing files (files in DB but not on disk)
+    let mut missing_files = 0;
+    for existing_path in existing_files.keys() {
+        if !seen_paths.contains(existing_path) {
+            // File no longer exists - remove from database
+            conn.execute("DELETE FROM files WHERE path = ?1", [existing_path])?;
+            missing_files += 1;
+        }
     }
 
     // Print summary
@@ -407,6 +542,15 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>)
 
     println!("\nScan complete in {:.1}s", result.duration.as_secs_f32());
     println!("  Files:      {:>6}", result.files.len());
+
+    if existing_count > 0 {
+        println!("  New:        {:>6}", new_files);
+        println!("  Updated:    {:>6}", updated_files);
+        println!("  Unchanged:  {:>6}", unchanged_files);
+        if missing_files > 0 {
+            println!("  Removed:    {:>6}", missing_files);
+        }
+    }
 
     let total_archives = result.zip_archives + result.sevenz_archives;
     if total_archives > 0 {
@@ -435,16 +579,17 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &PathBuf, threads: Option<usize>)
 
 fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
     // Load files from database
-    let mut file_stmt = conn.prepare("SELECT path, filename, size, crc32, md5, sha1 FROM files")?;
+    let mut file_stmt = conn.prepare("SELECT path, filename, size, mtime, crc32, md5, sha1 FROM files")?;
     let files: Vec<scan::ScannedFile> = file_stmt
         .query_map([], |row| {
             Ok(scan::ScannedFile {
                 path: PathBuf::from(row.get::<_, String>(0)?),
                 filename: row.get(1)?,
                 size: row.get::<_, i64>(2)? as u64,
-                crc32: row.get(3)?,
-                md5: row.get(4)?,
-                sha1: row.get(5)?,
+                mtime: row.get(3)?,
+                crc32: row.get(4)?,
+                md5: row.get(5)?,
+                sha1: row.get(6)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -557,10 +702,14 @@ fn cmd_organise(
     target: &PathBuf,
     dry_run: bool,
     copy: bool,
+    loose: bool,
+    zip_per_dat: bool,
 ) -> Result<()> {
+
     // Load all matched files with their DAT and set info
+    // Include category for directory structure
     let mut stmt = conn.prepare(
-        "SELECT f.path, f.filename, de.name as rom_name, d.name as dat_name, s.name as set_name
+        "SELECT f.path, f.filename, de.name as rom_name, d.name as dat_name, s.name as set_name, d.category
          FROM files f
          JOIN dat_entries de ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
          JOIN dat_versions dv ON de.dat_version_id = dv.id
@@ -568,7 +717,8 @@ fn cmd_organise(
          LEFT JOIN sets s ON de.set_id = s.id",
     )?;
 
-    let matches: Vec<(PathBuf, String, String, String, Option<String>)> = stmt
+    // (source_path, filename, rom_name, dat_name, set_name, category)
+    let matches: Vec<(PathBuf, String, String, String, Option<String>, Option<String>)> = stmt
         .query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -576,6 +726,7 @@ fn cmd_organise(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -586,21 +737,45 @@ fn cmd_organise(
         return Ok(());
     }
 
+    let mode_desc = if loose {
+        "as loose files"
+    } else if zip_per_dat {
+        "into ZIP per DAT"
+    } else {
+        "into TorrentZIP per set"
+    };
+
     println!(
         "{}",
         if dry_run {
-            "Dry run - showing what would be done:"
+            format!("Dry run - showing what would be organised {}:", mode_desc)
         } else {
-            "Organising files..."
+            format!("Organising files {}...", mode_desc)
         }
     );
 
+    if loose {
+        organise_loose(&matches, target, dry_run, copy)
+    } else if zip_per_dat {
+        organise_zip_per_dat(&matches, target, dry_run, copy)
+    } else {
+        organise_zip_per_set(&matches, target, dry_run, copy)
+    }
+}
+
+/// Organise files as loose files
+fn organise_loose(
+    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
+    target: &PathBuf,
+    dry_run: bool,
+    copy: bool,
+) -> Result<()> {
     let mut organised = 0;
     let mut skipped = 0;
     let mut errors = 0;
     let mut seen_archives: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    for (source_path, _filename, rom_name, dat_name, set_name) in &matches {
+    for (source_path, _filename, rom_name, _dat_name, set_name, category) in matches {
         // Handle archive paths (archive.zip#entry.rom)
         let (actual_source, target_filename) = if let Some(hash_pos) =
             source_path.to_string_lossy().find('#')
@@ -627,12 +802,17 @@ fn cmd_organise(
             (source_path.clone(), rom_name.clone())
         };
 
-        // Create target path: target/dat_name/[set_name/]filename
-        // For multi-ROM sets, include set name as subdirectory
-        let target_dir = if let Some(set) = set_name {
-            target.join(sanitise_path(dat_name)).join(sanitise_path(set))
+        // Create target path: target/category/[set_name/]filename
+        // Category is the directory path like "CPC/Games/[DSK]"
+        let base_dir = if let Some(cat) = category {
+            target.join(cat)
         } else {
-            target.join(sanitise_path(dat_name))
+            target.clone()
+        };
+        let target_dir = if let Some(set) = set_name {
+            base_dir.join(sanitise_path(set))
+        } else {
+            base_dir
         };
         let target_path = target_dir.join(&target_filename);
 
@@ -663,14 +843,12 @@ fn cmd_organise(
             );
             organised += 1;
         } else {
-            // Create target directory
             if let Err(e) = std::fs::create_dir_all(&target_dir) {
                 eprintln!("  Error creating {}: {}", target_dir.display(), e);
                 errors += 1;
                 continue;
             }
 
-            // Copy or move the file
             let result = if copy {
                 std::fs::copy(&actual_source, &target_path).map(|_| ())
             } else {
@@ -678,16 +856,73 @@ fn cmd_organise(
             };
 
             match result {
-                Ok(()) => {
-                    organised += 1;
+                Ok(()) => organised += 1,
+                Err(e) => {
+                    eprintln!("  Error: {}", e);
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    print_organise_summary(organised, skipped, errors, dry_run, copy);
+    Ok(())
+}
+
+/// Organise files into ZIP archives, one per set
+fn organise_zip_per_set(
+    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
+    target: &PathBuf,
+    dry_run: bool,
+    copy: bool,
+) -> Result<()> {
+    // Group files by (category, set_name)
+    // category is the path like "CPC/Games/[DSK]"
+    let mut sets: std::collections::HashMap<(String, String), Vec<(PathBuf, String)>> =
+        std::collections::HashMap::new();
+
+    for (source_path, _filename, rom_name, _dat_name, set_name, category) in matches {
+        let cat = category.clone().unwrap_or_default();
+        let set = set_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let set_key = (cat, set);
+        sets.entry(set_key)
+            .or_default()
+            .push((source_path.clone(), rom_name.clone()));
+    }
+
+    let mut archives_created = 0;
+    let mut files_packed = 0;
+    let mut errors = 0;
+
+    for ((category, set_name), files) in &sets {
+        // Use category path for directory structure
+        let target_dir = target.join(category);
+        let archive_name = format!("{}.zip", sanitise_path(&set_name));
+        let archive_path = target_dir.join(&archive_name);
+
+        if dry_run {
+            println!("  {} ({} files)", archive_path.display(), files.len());
+            archives_created += 1;
+            files_packed += files.len();
+        } else {
+            if archive_path.exists() {
+                continue;
+            }
+
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                eprintln!("  Error creating {}: {}", target_dir.display(), e);
+                errors += 1;
+                continue;
+            }
+
+            match create_archive_from_matches(&archive_path, files, copy) {
+                Ok(count) => {
+                    println!("  {} ({} files)", archive_path.display(), count);
+                    archives_created += 1;
+                    files_packed += count;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  Error {} {}: {}",
-                        if copy { "copying" } else { "moving" },
-                        actual_source.display(),
-                        e
-                    );
+                    eprintln!("  [ERROR] {}: {}", archive_path.display(), e);
                     errors += 1;
                 }
             }
@@ -695,27 +930,174 @@ fn cmd_organise(
     }
 
     println!();
-    println!(
-        "{}:",
+    println!("{}:", if dry_run { "Would create" } else { "Created" });
+    println!("  Archives: {:>6}", archives_created);
+    println!("  Files:    {:>6}", files_packed);
+    if errors > 0 {
+        println!("  Errors:   {:>6}", errors);
+    }
+
+    Ok(())
+}
+
+/// Organise files into ZIP archives, one per DAT
+fn organise_zip_per_dat(
+    matches: &[(PathBuf, String, String, String, Option<String>, Option<String>)],
+    target: &PathBuf,
+    dry_run: bool,
+    copy: bool,
+) -> Result<()> {
+    // Group files by (category, dat_name)
+    // category is the path like "CPC/Games/[DSK]"
+    let mut dats: std::collections::HashMap<(String, String), Vec<(PathBuf, String, Option<String>)>> =
+        std::collections::HashMap::new();
+
+    for (source_path, _filename, rom_name, dat_name, set_name, category) in matches {
+        let cat = category.clone().unwrap_or_default();
+        let dat_key = (cat, dat_name.clone());
+        dats.entry(dat_key)
+            .or_default()
+            .push((source_path.clone(), rom_name.clone(), set_name.clone()));
+    }
+
+    let mut archives_created = 0;
+    let mut files_packed = 0;
+    let mut errors = 0;
+
+    for ((category, dat_name), files) in &dats {
+        // Use category path for directory structure
+        let target_dir = target.join(category);
+        let archive_name = format!("{}.zip", sanitise_path(dat_name));
+        let archive_path = target_dir.join(&archive_name);
+
         if dry_run {
-            "Would organise"
+            println!("  {} ({} files)", archive_path.display(), files.len());
+            archives_created += 1;
+            files_packed += files.len();
         } else {
-            "Organised"
+            if archive_path.exists() {
+                continue;
+            }
+
+            if let Err(e) = std::fs::create_dir_all(&target_dir) {
+                eprintln!("  Error creating {}: {}", target_dir.display(), e);
+                errors += 1;
+                continue;
+            }
+
+            // For per-DAT archives, include set name in the path inside the archive
+            let files_with_paths: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|(path, rom_name, set_name)| {
+                    let inner_path = if let Some(set) = set_name {
+                        format!("{}/{}", sanitise_path(set), rom_name)
+                    } else {
+                        rom_name.clone()
+                    };
+                    (path.clone(), inner_path)
+                })
+                .collect();
+
+            match create_archive_from_matches(&archive_path, &files_with_paths, copy) {
+                Ok(count) => {
+                    println!("  {} ({} files)", archive_path.display(), count);
+                    archives_created += 1;
+                    files_packed += count;
+                }
+                Err(e) => {
+                    eprintln!("  [ERROR] {}: {}", archive_path.display(), e);
+                    errors += 1;
+                }
+            }
         }
-    );
-    println!(
-        "  {}: {:>6}",
-        if copy { "Copied" } else { "Moved" },
-        organised
-    );
+    }
+
+    println!();
+    println!("{}:", if dry_run { "Would create" } else { "Created" });
+    println!("  Archives: {:>6}", archives_created);
+    println!("  Files:    {:>6}", files_packed);
+    if errors > 0 {
+        println!("  Errors:   {:>6}", errors);
+    }
+
+    Ok(())
+}
+
+/// Create a ZIP archive from matched files (TorrentZIP compliant)
+fn create_archive_from_matches(
+    archive_path: &PathBuf,
+    files: &[(PathBuf, String)],
+    _copy: bool,
+) -> Result<usize> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(archive_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+
+    // TorrentZIP settings: deflate level 9, no extra fields
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(9));
+
+    // TorrentZIP requires alphabetically sorted entries
+    let mut sorted_files: Vec<_> = files.to_vec();
+    sorted_files.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+    let mut count = 0;
+    for (source_path, inner_name) in &sorted_files {
+        // Handle archive paths - need to extract the file
+        let content = if let Some(hash_pos) = source_path.to_string_lossy().find('#') {
+            let archive_path_str = &source_path.to_string_lossy()[..hash_pos];
+            let entry_name = &source_path.to_string_lossy()[hash_pos + 1..];
+            extract_file_from_archive(&PathBuf::from(archive_path_str), entry_name)?
+        } else {
+            std::fs::read(source_path)?
+        };
+
+        zip.start_file(inner_name, options)?;
+        zip.write_all(&content)?;
+        count += 1;
+    }
+
+    zip.finish()?;
+    Ok(count)
+}
+
+/// Extract a single file from an archive
+fn extract_file_from_archive(archive_path: &PathBuf, entry_name: &str) -> Result<Vec<u8>> {
+    let ext = archive_path
+        .extension()
+        .map(|s| s.to_ascii_lowercase().to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if ext == "zip" {
+        let file = std::fs::File::open(archive_path)?;
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
+        let mut entry = archive.by_name(entry_name)?;
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut content)?;
+        Ok(content)
+    } else if ext == "7z" {
+        // Extract to temp and read
+        let temp_dir = tempfile::tempdir()?;
+        sevenz_rust::decompress_file(archive_path, temp_dir.path())?;
+        let extracted_path = temp_dir.path().join(entry_name);
+        Ok(std::fs::read(extracted_path)?)
+    } else {
+        Err(anyhow::anyhow!("Unknown archive format"))
+    }
+}
+
+fn print_organise_summary(organised: usize, skipped: usize, errors: usize, dry_run: bool, copy: bool) {
+    println!();
+    println!("{}:", if dry_run { "Would organise" } else { "Organised" });
+    println!("  {}: {:>6}", if copy { "Copied" } else { "Moved" }, organised);
     if skipped > 0 {
         println!("  Skipped:  {:>6}", skipped);
     }
     if errors > 0 {
         println!("  Errors:   {:>6}", errors);
     }
-
-    Ok(())
 }
 
 /// Sanitise a string for use as a directory/file name
@@ -853,6 +1235,180 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
+    println!("Collection Health Report");
+    println!("========================\n");
+
+    // Basic counts
+    let dat_count: i64 = conn.query_row("SELECT COUNT(*) FROM dats", [], |row| row.get(0))?;
+    let entry_count: i64 = conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
+    let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+
+    if dat_count == 0 {
+        println!("No DATs loaded. Run `bitshelf dat import` first.");
+        return Ok(());
+    }
+
+    if file_count == 0 {
+        println!("No files scanned. Run `bitshelf scan` first.");
+        println!("  DATs loaded: {}", dat_count);
+        println!("  DAT entries: {}", entry_count);
+        return Ok(());
+    }
+
+    // Verified files (match by hash AND correct name)
+    let verified_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT f.id) FROM files f
+         JOIN dat_entries de ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         WHERE LOWER(f.filename) = LOWER(de.name)",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Misnamed files (match by hash but wrong name)
+    let misnamed_count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT f.id) FROM files f
+         JOIN dat_entries de ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         WHERE LOWER(f.filename) != LOWER(de.name)
+         AND f.path NOT LIKE '%#%'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Unmatched files (no DAT match)
+    let unmatched_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files f
+         WHERE NOT EXISTS (
+             SELECT 1 FROM dat_entries de
+             WHERE f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Missing entries (DAT entries with no matching file)
+    let missing_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dat_entries de
+         WHERE NOT EXISTS (
+             SELECT 1 FROM files f
+             WHERE f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Duplicate files
+    let duplicate_groups: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT sha1 FROM files GROUP BY sha1 HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let duplicate_files: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(cnt), 0) FROM (
+             SELECT COUNT(*) as cnt FROM files GROUP BY sha1 HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Wasted space from duplicates
+    let wasted_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(wasted), 0) FROM (
+             SELECT (COUNT(*) - 1) * (SUM(size) / COUNT(*)) as wasted
+             FROM files GROUP BY sha1 HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // DATs with zero matches
+    let empty_dats: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dats d
+         WHERE NOT EXISTS (
+             SELECT 1 FROM dat_versions dv
+             JOIN dat_entries de ON dv.id = de.dat_version_id
+             JOIN files f ON f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size)
+             WHERE dv.dat_id = d.id
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Calculate percentages
+    let verified_pct = (verified_count as f64 / entry_count as f64) * 100.0;
+    let missing_pct = (missing_count as f64 / entry_count as f64) * 100.0;
+
+    // Print summary
+    println!("Overview");
+    println!("--------");
+    println!("  DATs loaded:      {:>8}", dat_count);
+    println!("  DAT entries:      {:>8}", entry_count);
+    println!("  Files scanned:    {:>8}", file_count);
+    println!();
+
+    println!("Verification Status");
+    println!("-------------------");
+    println!("  Verified:         {:>8} ({:.1}%)", verified_count, verified_pct);
+    println!("  Missing:          {:>8} ({:.1}%)", missing_count, missing_pct);
+    println!();
+
+    // Issues section
+    let has_issues = misnamed_count > 0 || unmatched_count > 0 || duplicate_groups > 0 || empty_dats > 0;
+
+    if has_issues {
+        println!("Issues Found");
+        println!("------------");
+
+        if misnamed_count > 0 {
+            println!("  Misnamed files:   {:>8}  <- Run `bitshelf rename --dry-run`", misnamed_count);
+        }
+
+        if unmatched_count > 0 {
+            println!("  Unmatched files:  {:>8}  <- Not in any DAT", unmatched_count);
+        }
+
+        if duplicate_groups > 0 {
+            println!("  Duplicate groups: {:>8}  ({} files, {} wasted)",
+                duplicate_groups, duplicate_files, format_bytes(wasted_bytes));
+            println!("                             <- Run `bitshelf duplicates --details`");
+        }
+
+        if empty_dats > 0 {
+            println!("  Empty DATs:       {:>8}  <- No matching files", empty_dats);
+        }
+
+        println!();
+    } else {
+        println!("No issues found.\n");
+    }
+
+    // Suggested actions
+    println!("Suggested Actions");
+    println!("-----------------");
+
+    if misnamed_count > 0 {
+        println!("  1. Fix misnamed files:  bitshelf rename --dry-run");
+    }
+
+    if missing_count > 0 && verified_pct < 100.0 {
+        println!("  {}. Find missing ROMs:    bitshelf verify --issues", if misnamed_count > 0 { "2" } else { "1" });
+    }
+
+    if duplicate_groups > 0 {
+        println!("  {}. Review duplicates:    bitshelf duplicates --details",
+            if misnamed_count > 0 && missing_count > 0 { "3" } else if misnamed_count > 0 || missing_count > 0 { "2" } else { "1" });
+    }
+
+    if !has_issues && verified_pct == 100.0 {
+        println!("  Collection is complete and healthy!");
+    }
+
+    Ok(())
+}
+
 /// Print category tree with rollup statistics
 fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
     use std::collections::BTreeMap;
@@ -931,3 +1487,223 @@ fn truncate_string(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len - 3])
     }
 }
+
+fn cmd_duplicates(conn: &rusqlite::Connection, show_details: bool) -> Result<()> {
+    // Find all SHA1 hashes that appear more than once
+    let mut stmt = conn.prepare(
+        "SELECT sha1, COUNT(*) as count, SUM(size) as total_size
+         FROM files
+         GROUP BY sha1
+         HAVING COUNT(*) > 1
+         ORDER BY total_size DESC",
+    )?;
+
+    let duplicates: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if duplicates.is_empty() {
+        println!("No duplicate files found.");
+        return Ok(());
+    }
+
+    // Calculate totals
+    let total_groups = duplicates.len();
+    let total_duplicate_files: i64 = duplicates.iter().map(|(_, count, _)| count).sum();
+    let total_wasted_bytes: i64 = duplicates
+        .iter()
+        .map(|(_, count, size)| {
+            // Wasted = (count - 1) * (size / count) = size - size/count
+            size - (size / count)
+        })
+        .sum();
+
+    println!("Duplicate Files Report");
+    println!("======================");
+    println!();
+    println!("Summary:");
+    println!("  Duplicate groups:   {:>8}", total_groups);
+    println!("  Total duplicates:   {:>8}", total_duplicate_files);
+    println!("  Wasted space:       {:>8}", format_bytes(total_wasted_bytes));
+    println!();
+
+    if show_details {
+        // Show each duplicate group with file paths
+        let mut path_stmt = conn.prepare(
+            "SELECT path, size FROM files WHERE sha1 = ?1 ORDER BY path",
+        )?;
+
+        for (sha1, count, _) in &duplicates {
+            let paths: Vec<(String, i64)> = path_stmt
+                .query_map([sha1], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if let Some((_, size)) = paths.first() {
+                println!("[{}] {} copies, {} each:", &sha1[..8], count, format_bytes(*size));
+                for (path, _) in &paths {
+                    println!("  {}", path);
+                }
+                println!();
+            }
+        }
+    } else {
+        // Show top duplicates by wasted space
+        println!("Top duplicates by wasted space (use --details for full list):");
+        println!();
+
+        let mut path_stmt = conn.prepare(
+            "SELECT path FROM files WHERE sha1 = ?1 ORDER BY path LIMIT 1",
+        )?;
+
+        for (sha1, count, total_size) in duplicates.iter().take(10) {
+            let size_per_file = total_size / count;
+            let wasted = total_size - size_per_file;
+
+            // Get first path as example
+            let example_path: String = path_stmt
+                .query_row([sha1], |row| row.get(0))
+                .unwrap_or_else(|_| "?".to_string());
+
+            // Extract just the filename for display
+            let filename = std::path::Path::new(&example_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(example_path.clone());
+
+            println!(
+                "  {:40} {:>3} copies  {:>10} wasted",
+                truncate_string(&filename, 40),
+                count,
+                format_bytes(wasted)
+            );
+        }
+
+        if total_groups > 10 {
+            println!("  ... and {} more duplicate groups", total_groups - 10);
+        }
+    }
+
+    Ok(())
+}
+
+/// Format bytes as human-readable string
+fn format_bytes(bytes: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = KB * 1024;
+    const GB: i64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn cmd_rename(conn: &rusqlite::Connection, dry_run: bool) -> Result<()> {
+    // Find misnamed files: files that match a DAT entry by hash but have wrong filename
+    // Only consider loose files (not inside archives - those have # in path)
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT f.path, f.filename, de.name as correct_name
+         FROM files f
+         JOIN dat_entries de ON (f.sha1 = de.sha1 OR (f.crc32 = de.crc32 AND f.size = de.size))
+         WHERE f.path NOT LIKE '%#%'
+           AND LOWER(f.filename) != LOWER(de.name)
+         ORDER BY f.path",
+    )?;
+
+    let misnamed: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if misnamed.is_empty() {
+        println!("No misnamed files found.");
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        if dry_run {
+            "Dry run - showing what would be renamed:"
+        } else {
+            "Renaming misnamed files..."
+        }
+    );
+    println!();
+
+    let mut renamed = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+
+    for (path_str, current_name, correct_name) in &misnamed {
+        let path = PathBuf::from(path_str);
+
+        // Build the new path (same directory, new filename)
+        let new_path = path.parent()
+            .map(|p| p.join(correct_name))
+            .unwrap_or_else(|| PathBuf::from(correct_name));
+
+        // Check if source exists
+        if !path.exists() {
+            if dry_run {
+                println!("  [MISSING] {}", path.display());
+            }
+            skipped += 1;
+            continue;
+        }
+
+        // Check if target already exists
+        if new_path.exists() {
+            if dry_run {
+                println!("  [EXISTS] {} -> {} (target exists)", current_name, correct_name);
+            }
+            skipped += 1;
+            continue;
+        }
+
+        if dry_run {
+            println!("  {} -> {}", current_name, correct_name);
+            renamed += 1;
+        } else {
+            match std::fs::rename(&path, &new_path) {
+                Ok(()) => {
+                    println!("  {} -> {}", current_name, correct_name);
+                    renamed += 1;
+
+                    // Update the database with the new path
+                    let new_path_str = new_path.to_string_lossy().to_string();
+                    conn.execute(
+                        "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
+                        rusqlite::params![new_path_str, correct_name, path_str],
+                    )?;
+                }
+                Err(e) => {
+                    eprintln!("  [ERROR] {} -> {}: {}", current_name, correct_name, e);
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "{}:",
+        if dry_run { "Would rename" } else { "Renamed" }
+    );
+    println!("  Renamed:    {:>6}", renamed);
+    if skipped > 0 {
+        println!("  Skipped:    {:>6}", skipped);
+    }
+    if errors > 0 {
+        println!("  Errors:     {:>6}", errors);
+    }
+
+    Ok(())
+}
+

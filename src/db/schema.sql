@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS dats (
     format TEXT NOT NULL,
     file_path TEXT NOT NULL,
     file_sha1 TEXT NOT NULL,
+    file_size INTEGER,
+    file_mtime INTEGER,
     category TEXT
 );
 
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS files (
     path TEXT NOT NULL UNIQUE,
     filename TEXT NOT NULL,
     size INTEGER NOT NULL,
+    mtime INTEGER,
     crc32 TEXT,
     md5 TEXT,
     sha1 TEXT,
@@ -70,3 +73,10 @@ CREATE INDEX IF NOT EXISTS idx_dat_entries_crc32 ON dat_entries(crc32);
 CREATE INDEX IF NOT EXISTS idx_dat_entries_sha1 ON dat_entries(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
+
+-- Index for rescan optimization (lookup by path)
+CREATE INDEX IF NOT EXISTS idx_dats_file_path ON dats(file_path);
+
+-- Schema migrations for existing databases
+-- Add mtime column to files if not exists
+-- SQLite doesn't have IF NOT EXISTS for columns, but we handle this in code

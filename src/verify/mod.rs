@@ -107,6 +107,7 @@ mod tests {
             path: filename.into(),
             filename: filename.to_string(),
             size: 1024,
+            mtime: None,
             crc32: crc32.to_string(),
             md5: "md5hash".to_string(),
             sha1: sha1.to_string(),

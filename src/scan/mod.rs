@@ -21,6 +21,7 @@ pub struct ScannedFile {
     pub path: PathBuf,
     pub filename: String,
     pub size: u64,
+    pub mtime: Option<i64>,
     pub crc32: String,
     pub md5: String,
     pub sha1: String,
@@ -263,6 +264,15 @@ fn is_7z_file(path: &Path) -> bool {
 fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+
+    // Get archive mtime for entries (they don't have their own reliable mtime)
+    let archive_mtime = file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
     let mut archive = ZipArchive::new(BufReader::new(file))
         .with_context(|| format!("Failed to read ZIP archive: {}", archive_path.display()))?;
 
@@ -299,6 +309,7 @@ fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
             path: virtual_path,
             filename,
             size: entry_size,
+            mtime: archive_mtime,
             crc32: hashes.0,
             md5: hashes.1,
             sha1: hashes.2,
@@ -310,6 +321,13 @@ fn scan_zip_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
 
 /// Scan contents of a 7z archive
 fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
+    // Get archive mtime for entries
+    let archive_mtime = std::fs::metadata(archive_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
     // 7z requires extraction - use temp directory
     let temp_dir = tempfile::tempdir()
         .with_context(|| "Failed to create temp directory for 7z extraction")?;
@@ -343,6 +361,9 @@ fn scan_7z_archive(archive_path: &Path) -> Result<Vec<ScannedFile>> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
 
+            // Use archive mtime for entries (extracted files have temp mtime)
+            scanned.mtime = archive_mtime;
+
             files.push(scanned);
         }
     }
@@ -360,6 +381,13 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
 
     let (crc32, md5, sha1) = hash_reader(&mut reader)?;
 
+    // Get mtime as Unix timestamp
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+
     Ok(ScannedFile {
         path: path.to_path_buf(),
         filename: path
@@ -367,6 +395,7 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default(),
         size: metadata.len(),
+        mtime,
         crc32,
         md5,
         sha1,
