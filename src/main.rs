@@ -37,12 +37,16 @@ enum Commands {
     },
     /// Scan ROM directories
     Scan {
-        /// Directory to scan
-        path: PathBuf,
+        /// Directory to scan (optional with --prune)
+        path: Option<PathBuf>,
 
         /// Number of worker threads (default: all cores)
         #[arg(long, short = 't')]
         threads: Option<usize>,
+
+        /// Remove database entries for files that no longer exist on disk
+        #[arg(long)]
+        prune: bool,
     },
     /// Verify ROMs against loaded DATs
     Verify {
@@ -131,6 +135,10 @@ enum DatCommands {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Show what would be removed without actually removing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -149,9 +157,18 @@ fn main() -> Result<()> {
             DatCommands::ImportDir { path, prefix } => cmd_dat_import_dir(&conn, &path, prefix.as_deref(), verbose),
             DatCommands::List { category, search } => cmd_dat_list(&conn, category.as_deref(), search.as_deref()),
             DatCommands::Info { dat } => cmd_dat_info(&conn, &dat),
-            DatCommands::Remove { dat, yes } => cmd_dat_remove(&conn, &dat, yes),
+            DatCommands::Remove { dat, yes, dry_run } => cmd_dat_remove(&conn, &dat, yes, dry_run),
         },
-        Commands::Scan { path, threads } => cmd_scan(&conn, &path, threads, verbose),
+        Commands::Scan { path, threads, prune } => {
+            if prune {
+                cmd_prune(&conn, verbose)
+            } else if let Some(path) = path {
+                cmd_scan(&conn, &path, threads, verbose)
+            } else {
+                eprintln!("Error: Path required unless using --prune");
+                std::process::exit(1);
+            }
+        }
         Commands::Verify { issues } => cmd_verify(&conn, issues),
         Commands::Organise { target, dry_run, copy, loose, zip_per_dat, rename_only } => {
             if rename_only {
@@ -618,7 +635,7 @@ fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
 }
 
 /// Remove a DAT and all its entries
-fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool) -> Result<()> {
+fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool, dry_run: bool) -> Result<()> {
     // Try to find by ID first, then by name
     let dat_id: Option<i64> = dat_ref.parse().ok().and_then(|id: i64| {
         conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0)).ok()
@@ -660,6 +677,40 @@ fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
+    // Get version ID for counts/deletion
+    let version_id: i64 = conn.query_row(
+        "SELECT id FROM dat_versions WHERE dat_id = ?1",
+        [dat_id],
+        |row| row.get(0),
+    )?;
+
+    // Get counts for display
+    let set_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sets WHERE dat_version_id = ?1",
+        [version_id],
+        |row| row.get(0),
+    )?;
+
+    let match_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM matches WHERE dat_entry_id IN (SELECT id FROM dat_entries WHERE dat_version_id = ?1)",
+        [version_id],
+        |row| row.get(0),
+    )?;
+
+    // Dry run - just show what would be removed
+    if dry_run {
+        println!("Would remove:");
+        println!("  [{}] {}", dat_id, name);
+        println!();
+        println!("Would delete:");
+        println!("  Entries:    {:>6}", entry_count);
+        println!("  Sets:       {:>6}", set_count);
+        if match_count > 0 {
+            println!("  Matches:    {:>6}", match_count);
+        }
+        return Ok(());
+    }
+
     // Confirm deletion unless -y flag was passed
     if !skip_confirm {
         println!("About to remove:");
@@ -678,13 +729,6 @@ fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool
             return Ok(());
         }
     }
-
-    // Get version ID for cascade deletion
-    let version_id: i64 = conn.query_row(
-        "SELECT id FROM dat_versions WHERE dat_id = ?1",
-        [dat_id],
-        |row| row.get(0),
-    )?;
 
     // Delete in order: matches -> dat_entries -> sets -> dat_versions -> dats
     // Note: matches reference dat_entries, so delete them first
@@ -906,6 +950,64 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
             println!("  {} ({})", skip.path.display(), skip.reason);
         }
     }
+
+    Ok(())
+}
+
+/// Remove database entries for files that no longer exist on disk
+fn cmd_prune(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
+    eprintln!("Checking for stale database entries...");
+
+    // Load all file paths from database
+    let paths: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM files")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+
+    let total = paths.len();
+    if total == 0 {
+        println!("No files in database.");
+        return Ok(());
+    }
+
+    eprintln!("Checking {} files...", total);
+
+    let mut pruned = 0;
+    let mut kept = 0;
+
+    for (i, (id, path_str)) in paths.iter().enumerate() {
+        // Show progress periodically
+        if (i + 1) % 1000 == 0 || i + 1 == total {
+            eprint!("\r  Checked: {:>6}/{}", i + 1, total);
+        }
+
+        // Handle archive paths (archive.zip#entry.rom)
+        let path_to_check = if let Some(hash_pos) = path_str.find('#') {
+            PathBuf::from(&path_str[..hash_pos])
+        } else {
+            PathBuf::from(path_str)
+        };
+
+        if path_to_check.exists() {
+            kept += 1;
+        } else {
+            // File no longer exists - remove from database
+            if verbose {
+                eprintln!("\r  Pruning: {}", path_str);
+            }
+            conn.execute("DELETE FROM files WHERE id = ?1", [id])?;
+            pruned += 1;
+        }
+    }
+
+    eprintln!(); // Clear progress line
+
+    println!("\nPrune complete:");
+    println!("  Checked:    {:>6}", total);
+    println!("  Kept:       {:>6}", kept);
+    println!("  Pruned:     {:>6}", pruned);
 
     Ok(())
 }
