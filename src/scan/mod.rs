@@ -45,20 +45,26 @@ pub struct ScanResult {
     pub duration: Duration,
 }
 
+/// Progress for a single file being processed
+#[derive(Debug, Clone)]
+pub struct FileProgress {
+    pub path: String,
+    pub size: u64,
+    pub bytes_done: u64,
+}
+
 /// Progress tracking for scans
 pub struct ScanProgress {
     pub discovered: AtomicU64,
     pub processed: AtomicU64,
     pub archives_opened: AtomicU64,
     pub start_time: Instant,
-    /// Current file being processed (for verbose output)
-    current_file: std::sync::Mutex<Option<String>>,
-    /// Current file's total size in bytes
-    pub current_file_size: AtomicU64,
-    /// Bytes hashed so far in current file
-    pub current_file_bytes: AtomicU64,
     /// Total bytes hashed across all files
     pub total_bytes: AtomicU64,
+    /// Files currently being processed by workers (thread_id -> progress)
+    active_files: std::sync::Mutex<std::collections::HashMap<u64, FileProgress>>,
+    /// Counter for generating unique worker IDs
+    next_worker_id: AtomicU64,
 }
 
 impl ScanProgress {
@@ -68,10 +74,9 @@ impl ScanProgress {
             processed: AtomicU64::new(0),
             archives_opened: AtomicU64::new(0),
             start_time: Instant::now(),
-            current_file: std::sync::Mutex::new(None),
-            current_file_size: AtomicU64::new(0),
-            current_file_bytes: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
+            active_files: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_worker_id: AtomicU64::new(0),
         }
     }
 
@@ -94,37 +99,53 @@ impl ScanProgress {
         }
     }
 
-    /// Set the current file being processed (with size)
-    pub fn set_current_with_size(&self, path: &Path, size: u64) {
-        if let Ok(mut current) = self.current_file.lock() {
-            *current = Some(path.to_string_lossy().to_string());
+    /// Get a unique worker ID for tracking
+    pub fn get_worker_id(&self) -> u64 {
+        self.next_worker_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Start tracking a file for a worker
+    pub fn start_file(&self, worker_id: u64, path: &Path, size: u64) {
+        if let Ok(mut active) = self.active_files.lock() {
+            active.insert(worker_id, FileProgress {
+                path: path.to_string_lossy().to_string(),
+                size,
+                bytes_done: 0,
+            });
         }
-        self.current_file_size.store(size, Ordering::Relaxed);
-        self.current_file_bytes.store(0, Ordering::Relaxed);
     }
 
-    /// Set the current file being processed
-    pub fn set_current(&self, path: &Path) {
-        self.set_current_with_size(path, 0);
-    }
-
-    /// Add bytes to current file progress
-    pub fn add_bytes(&self, bytes: u64) {
-        self.current_file_bytes.fetch_add(bytes, Ordering::Relaxed);
+    /// Update bytes progress for a worker
+    pub fn update_bytes(&self, worker_id: u64, bytes: u64) {
         self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Ok(mut active) = self.active_files.lock() {
+            if let Some(progress) = active.get_mut(&worker_id) {
+                progress.bytes_done += bytes;
+            }
+        }
     }
 
-    /// Get the current file being processed
+    /// Finish tracking a file for a worker
+    pub fn finish_file(&self, worker_id: u64) {
+        if let Ok(mut active) = self.active_files.lock() {
+            active.remove(&worker_id);
+        }
+    }
+
+    /// Get all currently active files, sorted by size descending
+    pub fn get_active_files(&self) -> Vec<FileProgress> {
+        if let Ok(active) = self.active_files.lock() {
+            let mut files: Vec<_> = active.values().cloned().collect();
+            files.sort_by(|a, b| b.size.cmp(&a.size));
+            files
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the current file being processed (largest active file for display)
     pub fn get_current(&self) -> Option<String> {
-        self.current_file.lock().ok().and_then(|c| c.clone())
-    }
-
-    /// Get current file progress as (bytes_done, total_size)
-    pub fn get_file_progress(&self) -> (u64, u64) {
-        (
-            self.current_file_bytes.load(Ordering::Relaxed),
-            self.current_file_size.load(Ordering::Relaxed),
-        )
+        self.get_active_files().first().map(|f| f.path.clone())
     }
 }
 
@@ -258,9 +279,12 @@ fn process_work_item(
     sevenz_count: &Arc<AtomicU64>,
     progress: &Arc<ScanProgress>,
 ) -> Vec<ScannedFile> {
+    // Get a unique worker ID for this work item
+    let worker_id = progress.get_worker_id();
+
     match item {
         WorkItem::File(ref path) => {
-            match hash_file_with_progress(path, Some(progress)) {
+            match hash_file_with_progress(path, Some(progress), worker_id) {
                 Ok(f) => vec![f],
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -272,9 +296,8 @@ fn process_work_item(
             }
         }
         WorkItem::ZipArchive(ref path) => {
-            progress.set_current(path);
             zip_count.fetch_add(1, Ordering::Relaxed);
-            match scan_zip_archive_with_progress(path, progress) {
+            match scan_zip_archive_with_progress(path, progress, worker_id) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -286,9 +309,8 @@ fn process_work_item(
             }
         }
         WorkItem::SevenZArchive(ref path) => {
-            progress.set_current(path);
             sevenz_count.fetch_add(1, Ordering::Relaxed);
-            match scan_7z_archive_with_progress(path, progress) {
+            match scan_7z_archive_with_progress(path, progress, worker_id) {
                 Ok(files) => files,
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
@@ -324,7 +346,7 @@ fn is_7z_file(path: &Path) -> bool {
 }
 
 /// Scan contents of a ZIP archive with progress tracking
-fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>) -> Result<Vec<ScannedFile>> {
+fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>, worker_id: u64) -> Result<Vec<ScannedFile>> {
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
 
@@ -358,10 +380,11 @@ fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgre
             archive_path.display(),
             entry_name
         ));
-        progress.set_current_with_size(&virtual_path, entry_size);
+        progress.start_file(worker_id, &virtual_path, entry_size);
 
         // Hash the entry contents with progress
-        let hashes = hash_reader_with_progress(&mut entry, Some(progress))?;
+        let hashes = hash_reader_with_progress(&mut entry, Some(progress), worker_id)?;
+        progress.finish_file(worker_id);
 
         // For matching purposes, use just the entry filename
         let filename = Path::new(&entry_name)
@@ -384,7 +407,7 @@ fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgre
 }
 
 /// Scan contents of a 7z archive with progress tracking
-fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>) -> Result<Vec<ScannedFile>> {
+fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>, worker_id: u64) -> Result<Vec<ScannedFile>> {
     // Get archive mtime for entries
     let archive_mtime = std::fs::metadata(archive_path)
         .ok()
@@ -416,7 +439,7 @@ fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgres
             ));
 
             // Hash with progress tracking
-            let mut scanned = hash_file_with_progress(entry.path(), Some(progress))?;
+            let mut scanned = hash_file_with_progress(entry.path(), Some(progress), worker_id)?;
             scanned.path = virtual_path;
 
             // Update filename to just the file part
@@ -439,11 +462,11 @@ fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgres
 
 /// Hash a single file, computing CRC32, MD5, and SHA1 in a single read
 pub fn hash_file(path: &Path) -> Result<ScannedFile> {
-    hash_file_with_progress(path, None)
+    hash_file_with_progress(path, None, 0)
 }
 
 /// Hash a single file with optional progress tracking
-pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>) -> Result<ScannedFile> {
+pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>, worker_id: u64) -> Result<ScannedFile> {
     let file = File::open(path)
         .with_context(|| format!("Failed to open file: {}", path.display()))?;
     let metadata = file.metadata()?;
@@ -452,10 +475,15 @@ pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>
 
     // Set up progress tracking if provided
     if let Some(prog) = progress {
-        prog.set_current_with_size(path, size);
+        prog.start_file(worker_id, path, size);
     }
 
-    let (crc32, md5, sha1) = hash_reader_with_progress(&mut reader, progress)?;
+    let (crc32, md5, sha1) = hash_reader_with_progress(&mut reader, progress, worker_id)?;
+
+    // Finish tracking this file
+    if let Some(prog) = progress {
+        prog.finish_file(worker_id);
+    }
 
     // Get mtime as Unix timestamp
     let mtime = metadata
@@ -479,7 +507,7 @@ pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>
 }
 
 /// Hash content from a reader with optional progress tracking
-fn hash_reader_with_progress<R: Read>(reader: &mut R, progress: Option<&Arc<ScanProgress>>) -> Result<(String, String, String)> {
+fn hash_reader_with_progress<R: Read>(reader: &mut R, progress: Option<&Arc<ScanProgress>>, worker_id: u64) -> Result<(String, String, String)> {
     let mut crc = Crc32Hasher::new();
     let mut md5 = Md5::new();
     let mut sha1 = Sha1::new();
@@ -497,7 +525,7 @@ fn hash_reader_with_progress<R: Read>(reader: &mut R, progress: Option<&Arc<Scan
 
         // Update progress if tracking
         if let Some(prog) = progress {
-            prog.add_bytes(bytes_read as u64);
+            prog.update_bytes(worker_id, bytes_read as u64);
         }
     }
 

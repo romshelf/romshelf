@@ -793,38 +793,79 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
 
     // Progress display thread
     let display_handle = thread::spawn(move || {
+        let mut last_line_count = 0usize;
+
         loop {
             let discovered = progress_display.discovered.load(Ordering::Relaxed);
             let processed = progress_display.processed.load(Ordering::Relaxed);
             let bytes_sec = progress_display.bytes_per_sec();
-            let (file_bytes, file_size) = progress_display.get_file_progress();
 
             if verbose {
-                // Verbose mode: show current file with byte progress
-                let current = progress_display.get_current().unwrap_or_default();
-                // Truncate filename for display (show last 40 chars to make room for progress)
-                let display_name = if current.len() > 40 {
-                    format!("...{}", &current[current.len()-37..])
-                } else {
-                    current
-                };
+                // Clear previous lines if we printed multiple
+                if last_line_count > 0 {
+                    // Move cursor up and clear each line
+                    for _ in 0..last_line_count {
+                        eprint!("\x1b[A\x1b[2K"); // Move up, clear line
+                    }
+                }
+                eprint!("\r\x1b[2K"); // Clear current line
 
-                // Show file progress if we have size info (cap at 100% for display)
-                let file_progress = if file_size > 0 {
-                    let pct = ((file_bytes as f64 / file_size as f64) * 100.0).min(100.0);
-                    format!(" {:>3.0}%", pct)
-                } else {
-                    String::new()
-                };
+                // Get all active files (sorted by size, largest first)
+                let active_files = progress_display.get_active_files();
+                let file_count = active_files.len();
 
-                eprint!(
-                    "\r  [{:>6}/{:>6}] {:>8}/s  {}{}{}",
+                // Header line with overall progress
+                eprintln!(
+                    "  [{:>6}/{:>6}] {:>8}/s  {} active workers",
                     processed, discovered,
                     format_bytes_short(bytes_sec as i64),
-                    display_name,
-                    file_progress,
-                    " ".repeat(20) // Clear trailing chars
+                    file_count
                 );
+
+                // Show up to 8 active files with progress bars
+                let max_display = 8.min(file_count);
+                for (i, file_prog) in active_files.iter().take(max_display).enumerate() {
+                    // Extract just the filename (after # for archives, or last path component)
+                    let display_name = if let Some(hash_pos) = file_prog.path.rfind('#') {
+                        &file_prog.path[hash_pos + 1..]
+                    } else {
+                        file_prog.path.rsplit('/').next().unwrap_or(&file_prog.path)
+                    };
+
+                    // Truncate if too long (allow up to 80 chars for filename)
+                    let display_name = if display_name.len() > 80 {
+                        format!("...{}", &display_name[display_name.len()-77..])
+                    } else {
+                        display_name.to_string()
+                    };
+
+                    // Calculate progress percentage
+                    let pct = if file_prog.size > 0 {
+                        ((file_prog.bytes_done as f64 / file_prog.size as f64) * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    };
+
+                    // Tree-style prefix
+                    let prefix = if i == max_display - 1 { "└" } else { "├" };
+
+                    // Size display
+                    let size_str = format_bytes_short(file_prog.size as i64);
+
+                    eprintln!(
+                        "    {} {:>6} {:>3.0}%  {}",
+                        prefix, size_str, pct, display_name
+                    );
+                }
+
+                // Track how many lines we printed (1 header + file lines)
+                last_line_count = 1 + max_display;
+
+                // If there are more files, show count
+                if file_count > max_display {
+                    eprintln!("    ... and {} more", file_count - max_display);
+                    last_line_count += 1;
+                }
             } else {
                 eprint!(
                     "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>8}/s  ",
