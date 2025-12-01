@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,10 @@ struct Cli {
     /// Emit progress events as JSON instead of interactive text
     #[arg(long, global = true, default_value_t = false)]
     progress_json: bool,
+
+    /// Write all progress events to a JSON Lines log file
+    #[arg(long, global = true)]
+    progress_log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -166,7 +170,7 @@ fn main() -> Result<()> {
     let mut conn = db::init_db(&db_path)?;
 
     let verbose = cli.verbose;
-    let progress_sink = CliProgressSink::new(cli.progress_json);
+    let progress_sink = CliProgressSink::new(cli.progress_json, cli.progress_log.clone());
 
     match cli.command {
         Commands::Dat { command } => match command {
@@ -2268,13 +2272,27 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
 struct CliProgressSink {
     json: bool,
     stderr: Arc<Mutex<()>>,
+    log_file: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl CliProgressSink {
-    fn new(json: bool) -> Self {
+    fn new(json: bool, log_path: Option<PathBuf>) -> Self {
+        let log_file = log_path.and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(|file| Arc::new(Mutex::new(file)))
+                .map_err(|err| {
+                    eprintln!("Failed to open progress log: {}", err);
+                    err
+                })
+                .ok()
+        });
         Self {
             json,
             stderr: Arc::new(Mutex::new(())),
+            log_file,
         }
     }
 
@@ -2282,7 +2300,7 @@ impl CliProgressSink {
         self.json
     }
 
-    fn emit_json<T: Serialize>(&self, stream: &str, event: &T) {
+    fn emit_console_json<T: Serialize>(&self, stream: &str, event: &T) {
         if !self.json {
             return;
         }
@@ -2298,17 +2316,32 @@ impl CliProgressSink {
             }
         }
     }
+
+    fn log_event<T: Serialize>(&self, stream: &str, event: &T) {
+        if let Some(file) = &self.log_file
+            && let Ok(line) = serde_json::to_string(&json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "stream": stream,
+                "event": event
+            }))
+            && let Ok(mut handle) = file.lock()
+        {
+            let _ = writeln!(handle, "{}", line);
+        }
+    }
 }
 
 impl ProgressSink<DatImportEvent> for CliProgressSink {
     fn emit(&self, event: DatImportEvent) {
-        self.emit_json("dat_import", &event);
+        self.log_event("dat_import", &event);
+        self.emit_console_json("dat_import", &event);
     }
 }
 
 impl ProgressSink<ScanEvent> for CliProgressSink {
     fn emit(&self, event: ScanEvent) {
-        self.emit_json("scan", &event);
+        self.log_event("scan", &event);
+        self.emit_console_json("scan", &event);
     }
 }
 
