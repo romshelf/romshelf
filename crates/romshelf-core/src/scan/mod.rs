@@ -1,16 +1,17 @@
 //! File scanning module - directory walking, hashing, archive support, parallelism
 
+use crate::services::progress::{ProgressSink, ScanEvent};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Sender};
 use crc32fast::Hasher as Crc32Hasher;
+use crossbeam_channel::{Sender, bounded};
 use md5::{Digest, Md5};
 use rayon::prelude::*;
 use sha1::Sha1;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -65,6 +66,7 @@ pub struct ScanProgress {
     active_files: std::sync::Mutex<std::collections::HashMap<u64, FileProgress>>,
     /// Counter for generating unique worker IDs
     next_worker_id: AtomicU64,
+    sink: Option<Arc<dyn ProgressSink<ScanEvent>>>,
 }
 
 impl ScanProgress {
@@ -77,6 +79,14 @@ impl ScanProgress {
             total_bytes: AtomicU64::new(0),
             active_files: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_worker_id: AtomicU64::new(0),
+            sink: None,
+        }
+    }
+
+    pub fn with_sink(sink: Arc<dyn ProgressSink<ScanEvent>>) -> Self {
+        Self {
+            sink: Some(sink),
+            ..Self::new()
         }
     }
 
@@ -104,31 +114,54 @@ impl ScanProgress {
         self.next_worker_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn emit(&self, event: ScanEvent) {
+        if let Some(sink) = &self.sink {
+            sink.emit(event);
+        }
+    }
+
     /// Start tracking a file for a worker
     pub fn start_file(&self, worker_id: u64, path: &Path, size: u64) {
         if let Ok(mut active) = self.active_files.lock() {
-            active.insert(worker_id, FileProgress {
-                path: path.to_string_lossy().to_string(),
-                size,
-                bytes_done: 0,
-            });
+            active.insert(
+                worker_id,
+                FileProgress {
+                    path: path.to_string_lossy().to_string(),
+                    size,
+                    bytes_done: 0,
+                },
+            );
         }
+        self.emit(ScanEvent::FileStarted {
+            path: path.to_path_buf(),
+            size,
+        });
     }
 
     /// Update bytes progress for a worker
     pub fn update_bytes(&self, worker_id: u64, bytes: u64) {
         self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if let Ok(mut active) = self.active_files.lock() {
-            if let Some(progress) = active.get_mut(&worker_id) {
-                progress.bytes_done += bytes;
-            }
+        if let Ok(mut active) = self.active_files.lock()
+            && let Some(progress) = active.get_mut(&worker_id)
+        {
+            progress.bytes_done += bytes;
+            self.emit(ScanEvent::FileProgress {
+                path: PathBuf::from(progress.path.clone()),
+                bytes_done: progress.bytes_done,
+                bytes_total: progress.size,
+            });
         }
     }
 
     /// Finish tracking a file for a worker
     pub fn finish_file(&self, worker_id: u64) {
-        if let Ok(mut active) = self.active_files.lock() {
-            active.remove(&worker_id);
+        if let Ok(mut active) = self.active_files.lock()
+            && let Some(progress) = active.remove(&worker_id)
+        {
+            self.emit(ScanEvent::FileCompleted {
+                path: PathBuf::from(progress.path),
+                size: progress.size,
+            });
         }
     }
 
@@ -167,6 +200,7 @@ pub fn scan_directory_parallel(
     path: &Path,
     threads: usize,
     progress: Arc<ScanProgress>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
     let start_time = Instant::now();
     let (sender, receiver) = bounded::<WorkItem>(1000);
@@ -181,8 +215,14 @@ pub fn scan_directory_parallel(
     let path_owned = path.to_path_buf();
 
     // Discovery thread - walks directories and pushes work items
+    let cancel_discovery = cancel.clone();
     let discovery_handle = std::thread::spawn(move || {
-        discover_files(&path_owned, sender, &progress_discovery)
+        discover_files(
+            &path_owned,
+            sender,
+            &progress_discovery,
+            cancel_discovery.as_ref(),
+        )
     });
 
     // Process work items in parallel
@@ -208,6 +248,7 @@ pub fn scan_directory_parallel(
                     &zip_count_clone,
                     &sevenz_count_clone,
                     &progress_clone,
+                    cancel.as_ref(),
                 );
                 progress_clone.processed.fetch_add(1, Ordering::Relaxed);
                 result
@@ -226,6 +267,31 @@ pub fn scan_directory_parallel(
         Err(arc) => arc.lock().unwrap().clone(),
     };
 
+    let discovered_files = progress.discovered.load(Ordering::Relaxed);
+    let processed_files = progress.processed.load(Ordering::Relaxed);
+    let total_bytes = progress.total_bytes.load(Ordering::Relaxed);
+    let duration_ms = duration.as_millis();
+    let secs = duration.as_secs_f64();
+    let files_per_sec = if secs > 0.0 {
+        processed_files as f64 / secs
+    } else {
+        0.0
+    };
+    let bytes_per_sec = if secs > 0.0 {
+        total_bytes as f64 / secs
+    } else {
+        0.0
+    };
+
+    progress.emit(ScanEvent::Summary {
+        discovered_files,
+        processed_files,
+        total_bytes,
+        duration_ms,
+        files_per_sec,
+        bytes_per_sec,
+    });
+
     Ok(ScanResult {
         files,
         skipped: skipped_files,
@@ -241,8 +307,15 @@ fn discover_files(
     path: &Path,
     sender: Sender<WorkItem>,
     progress: &ScanProgress,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<()> {
     for entry in WalkDir::new(path).follow_links(true) {
+        if cancel
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -250,6 +323,12 @@ fn discover_files(
                 continue;
             }
         };
+
+        if entry.file_type().is_dir() {
+            progress.emit(ScanEvent::Discovery {
+                directory: entry.path().to_path_buf(),
+            });
+        }
 
         if entry.file_type().is_file() {
             let file_path = entry.path().to_path_buf();
@@ -278,12 +357,19 @@ fn process_work_item(
     zip_count: &Arc<AtomicU64>,
     sevenz_count: &Arc<AtomicU64>,
     progress: &Arc<ScanProgress>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Vec<ScannedFile> {
     // Get a unique worker ID for this work item
     let worker_id = progress.get_worker_id();
 
     match item {
         WorkItem::File(ref path) => {
+            if cancel
+                .map(|flag| flag.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                return Vec::new();
+            }
             match hash_file_with_progress(path, Some(progress), worker_id) {
                 Ok(f) => vec![f],
                 Err(e) => {
@@ -296,6 +382,12 @@ fn process_work_item(
             }
         }
         WorkItem::ZipArchive(ref path) => {
+            if cancel
+                .map(|flag| flag.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                return Vec::new();
+            }
             zip_count.fetch_add(1, Ordering::Relaxed);
             match scan_zip_archive_with_progress(path, progress, worker_id) {
                 Ok(files) => files,
@@ -309,6 +401,12 @@ fn process_work_item(
             }
         }
         WorkItem::SevenZArchive(ref path) => {
+            if cancel
+                .map(|flag| flag.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                return Vec::new();
+            }
             sevenz_count.fetch_add(1, Ordering::Relaxed);
             match scan_7z_archive_with_progress(path, progress, worker_id) {
                 Ok(files) => files,
@@ -327,7 +425,7 @@ fn process_work_item(
 /// Legacy single-threaded scan (for compatibility)
 pub fn scan_directory(path: &Path) -> Result<Vec<ScannedFile>> {
     let progress = Arc::new(ScanProgress::new());
-    let result = scan_directory_parallel(path, 1, progress)?;
+    let result = scan_directory_parallel(path, 1, progress, None)?;
     Ok(result.files)
 }
 
@@ -346,7 +444,11 @@ fn is_7z_file(path: &Path) -> bool {
 }
 
 /// Scan contents of a ZIP archive with progress tracking
-fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>, worker_id: u64) -> Result<Vec<ScannedFile>> {
+fn scan_zip_archive_with_progress(
+    archive_path: &Path,
+    progress: &Arc<ScanProgress>,
+    worker_id: u64,
+) -> Result<Vec<ScannedFile>> {
     let file = File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
 
@@ -375,11 +477,7 @@ fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgre
         let entry_size = entry.size();
 
         // Update progress for this entry
-        let virtual_path = PathBuf::from(format!(
-            "{}#{}",
-            archive_path.display(),
-            entry_name
-        ));
+        let virtual_path = PathBuf::from(format!("{}#{}", archive_path.display(), entry_name));
         progress.start_file(worker_id, &virtual_path, entry_size);
 
         // Hash the entry contents with progress
@@ -407,7 +505,11 @@ fn scan_zip_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgre
 }
 
 /// Scan contents of a 7z archive with progress tracking
-fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgress>, worker_id: u64) -> Result<Vec<ScannedFile>> {
+fn scan_7z_archive_with_progress(
+    archive_path: &Path,
+    progress: &Arc<ScanProgress>,
+    worker_id: u64,
+) -> Result<Vec<ScannedFile>> {
     // Get archive mtime for entries
     let archive_mtime = std::fs::metadata(archive_path)
         .ok()
@@ -416,8 +518,8 @@ fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgres
         .map(|d| d.as_secs() as i64);
 
     // 7z requires extraction - use temp directory
-    let temp_dir = tempfile::tempdir()
-        .with_context(|| "Failed to create temp directory for 7z extraction")?;
+    let temp_dir =
+        tempfile::tempdir().with_context(|| "Failed to create temp directory for 7z extraction")?;
 
     sevenz_rust::decompress_file(archive_path, temp_dir.path())
         .with_context(|| format!("Failed to extract 7z archive: {}", archive_path.display()))?;
@@ -432,11 +534,8 @@ fn scan_7z_archive_with_progress(archive_path: &Path, progress: &Arc<ScanProgres
                 .path()
                 .strip_prefix(temp_dir.path())
                 .unwrap_or(entry.path());
-            let virtual_path = PathBuf::from(format!(
-                "{}#{}",
-                archive_path.display(),
-                relative.display()
-            ));
+            let virtual_path =
+                PathBuf::from(format!("{}#{}", archive_path.display(), relative.display()));
 
             // Hash with progress tracking
             let mut scanned = hash_file_with_progress(entry.path(), Some(progress), worker_id)?;
@@ -466,9 +565,13 @@ pub fn hash_file(path: &Path) -> Result<ScannedFile> {
 }
 
 /// Hash a single file with optional progress tracking
-pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>, worker_id: u64) -> Result<ScannedFile> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open file: {}", path.display()))?;
+pub fn hash_file_with_progress(
+    path: &Path,
+    progress: Option<&Arc<ScanProgress>>,
+    worker_id: u64,
+) -> Result<ScannedFile> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let metadata = file.metadata()?;
     let size = metadata.len();
     let mut reader = BufReader::new(file);
@@ -507,7 +610,11 @@ pub fn hash_file_with_progress(path: &Path, progress: Option<&Arc<ScanProgress>>
 }
 
 /// Hash content from a reader with optional progress tracking
-fn hash_reader_with_progress<R: Read>(reader: &mut R, progress: Option<&Arc<ScanProgress>>, worker_id: u64) -> Result<(String, String, String)> {
+fn hash_reader_with_progress<R: Read>(
+    reader: &mut R,
+    progress: Option<&Arc<ScanProgress>>,
+    worker_id: u64,
+) -> Result<(String, String, String)> {
     let mut crc = Crc32Hasher::new();
     let mut md5 = Md5::new();
     let mut sha1 = Sha1::new();
@@ -554,10 +661,7 @@ mod tests {
         // These are the known hashes for "test content"
         assert_eq!(scanned.crc32, "57f4675d");
         assert_eq!(scanned.md5, "9473fdd0d880a43c21b7778d34872157");
-        assert_eq!(
-            scanned.sha1,
-            "1eebdf4fdc9fc7bf283031b93f9aef3338de9052"
-        );
+        assert_eq!(scanned.sha1, "1eebdf4fdc9fc7bf283031b93f9aef3338de9052");
     }
 
     #[test]
