@@ -77,6 +77,23 @@ CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 -- Index for rescan optimization (lookup by path)
 CREATE INDEX IF NOT EXISTS idx_dats_file_path ON dats(file_path);
 
+-- Directories (for lazy tree loading at scale)
+CREATE TABLE IF NOT EXISTS directories (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    parent_id INTEGER REFERENCES directories(id),
+    file_count INTEGER NOT NULL DEFAULT 0,
+    matched_count INTEGER NOT NULL DEFAULT 0,
+    total_size INTEGER NOT NULL DEFAULT 0
+);
+
+-- Index for fast child lookups
+CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories(parent_id);
+
+-- Foreign key from files to directories
+-- Note: directory_id is added via migration, not here
+
 -- Schema migrations for existing databases
 -- Add mtime column to files if not exists
 -- SQLite doesn't have IF NOT EXISTS for columns, but we handle this in code

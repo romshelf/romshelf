@@ -1,11 +1,20 @@
-[package]
-name = "bitshelf"
+[workspace]
+resolver = "2"
+members = [
+    "crates/romshelf-core",
+    "crates/romshelf-cli",
+    "ui/src-tauri",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "ROM collection manager - DAT-driven verification and organisation"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+romshelf-core = { path = "crates/romshelf-core" }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -39,6 +48,3 @@ num_cpus = "1.16"
 chrono = "0.4"
 dirs = "5"
 phf = { version = "0.13.1", features = ["macros"] }
-
-[dev-dependencies]
-tempfile = "3"

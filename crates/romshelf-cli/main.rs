@@ -6,18 +6,18 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use bitshelf::dat;
-use bitshelf::db;
-use bitshelf::scan::{self, ScanProgress};
-use bitshelf::tosec;
-use bitshelf::verify;
+use romshelf_core::dat;
+use romshelf_core::db;
+use romshelf_core::scan::{self, ScanProgress};
+use romshelf_core::tosec;
+use romshelf_core::verify;
 
 /// A matched file ready for organisation
 /// (source_path, filename, rom_name, dat_name, set_name, category)
 type MatchedFile = (PathBuf, String, String, String, Option<String>, Option<String>);
 
 #[derive(Parser)]
-#[command(name = "bitshelf")]
+#[command(name = "romshelf")]
 #[command(about = "ROM collection manager - DAT-driven verification and organisation")]
 struct Cli {
     /// Show verbose progress (current file, archives being opened, etc.)
@@ -185,9 +185,9 @@ fn main() -> Result<()> {
 
 fn get_db_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
-    let config_dir = home.join(".bitshelf");
+    let config_dir = home.join(".romshelf");
     std::fs::create_dir_all(&config_dir)?;
-    Ok(config_dir.join("bitshelf.db"))
+    Ok(config_dir.join("romshelf.db"))
 }
 
 /// Import result for tracking duplicates
@@ -518,7 +518,7 @@ fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, sear
         if category_filter.is_some() || search_filter.is_some() {
             println!("No DATs match the specified filters.");
         } else {
-            println!("No DATs imported yet. Use `bitshelf dat import <path>` to import one.");
+            println!("No DATs imported yet. Use `romshelf dat import <path>` to import one.");
         }
     } else {
         println!("Total: {} DATs", count);
@@ -814,12 +814,38 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
                 let active_files = progress_display.get_active_files();
                 let file_count = active_files.len();
 
-                // Header line with overall progress
+                // Extract unique directories currently being processed
+                let active_dirs: std::collections::HashSet<String> = active_files
+                    .iter()
+                    .filter_map(|f| {
+                        // Handle archive paths: /path/to/archive.zip#entry -> /path/to
+                        let base_path = if let Some(hash_pos) = f.path.rfind('#') {
+                            &f.path[..hash_pos]
+                        } else {
+                            &f.path
+                        };
+                        // Get parent directory
+                        std::path::Path::new(base_path)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                    })
+                    .collect();
+
+                // Show current directory (most common among active files, or first alphabetically)
+                let current_dir = active_dirs.iter().min().cloned().unwrap_or_default();
+                let display_dir = if current_dir.len() > 60 {
+                    format!("...{}", &current_dir[current_dir.len()-57..])
+                } else {
+                    current_dir
+                };
+
+                // Header line with overall progress and current directory
                 eprintln!(
-                    "  [{:>6}/{:>6}] {:>8}/s  {} active workers",
+                    "  [{:>6}/{:>6}] {:>8}/s  {} workers  {}",
                     processed, discovered,
                     format_bytes_short(bytes_sec as i64),
-                    file_count
+                    file_count,
+                    display_dir
                 );
 
                 // Show up to 8 active files with progress bars
@@ -902,9 +928,12 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
     // Store scanned files in database
     let now = chrono::Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
-        "INSERT OR REPLACE INTO files (path, filename, size, mtime, crc32, md5, sha1, scanned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO files (path, filename, size, mtime, crc32, md5, sha1, scanned_at, directory_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
+
+    // Cache for directory IDs to avoid repeated lookups
+    let mut dir_cache: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     let mut new_files = 0;
     let mut updated_files = 0;
@@ -928,6 +957,19 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
             new_files += 1;
         }
 
+        // Get or create directory entry
+        let dir_path = file.path.parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let dir_id = if let Some(&id) = dir_cache.get(&dir_path) {
+            id
+        } else {
+            let id = db::get_or_create_directory(conn, &dir_path)?;
+            dir_cache.insert(dir_path.clone(), id);
+            id
+        };
+
         stmt.execute(rusqlite::params![
             path_str,
             file.filename,
@@ -936,15 +978,19 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
             file.crc32,
             file.md5,
             file.sha1,
-            now
+            now,
+            dir_id
         ])?;
     }
 
-    // Handle missing files (files in DB but not on disk)
+    // Handle missing files (files in DB that were under this scan path but weren't found)
+    // Only remove files that are within the scanned directory - don't touch files from other paths
+    let scan_path_str = path.to_string_lossy().to_string();
     let mut missing_files = 0;
     for existing_path in existing_files.keys() {
-        if !seen_paths.contains(existing_path) {
-            // File no longer exists - remove from database
+        // Only consider files that are under the scanned directory
+        if existing_path.starts_with(&scan_path_str) && !seen_paths.contains(existing_path) {
+            // File was in the scanned directory but no longer exists - remove from database
             conn.execute("DELETE FROM files WHERE path = ?1", [existing_path])?;
             missing_files += 1;
         }
@@ -990,6 +1036,13 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
         for skip in &result.skipped {
             println!("  {} ({})", skip.path.display(), skip.reason);
         }
+    }
+
+    // Recompute directory statistics (rollup from files to directories)
+    if !dir_cache.is_empty() {
+        eprint!("  Computing directory statistics...");
+        db::recompute_directory_stats(conn)?;
+        eprintln!(" done ({} directories)", dir_cache.len());
     }
 
     Ok(())
@@ -1095,12 +1148,12 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
         .collect();
 
     if all_entries.is_empty() {
-        println!("No DATs loaded. Use `bitshelf dat import <path>` first.");
+        println!("No DATs loaded. Use `romshelf dat import <path>` first.");
         return Ok(());
     }
 
     if files.is_empty() {
-        println!("No files scanned. Use `bitshelf scan <path>` first.");
+        println!("No files scanned. Use `romshelf scan <path>` first.");
         return Ok(());
     }
 
@@ -1208,7 +1261,7 @@ fn cmd_organise(
         .collect();
 
     if matches.is_empty() {
-        println!("No matched files to organise. Run `bitshelf scan` and `bitshelf verify` first.");
+        println!("No matched files to organise. Run `romshelf scan` and `romshelf verify` first.");
         return Ok(());
     }
 
@@ -1600,7 +1653,7 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     println!();
 
     if dat_count == 0 {
-        println!("No DATs loaded. Use `bitshelf dat import` or `bitshelf dat import-dir` first.");
+        println!("No DATs loaded. Use `romshelf dat import` or `romshelf dat import-dir` first.");
         return Ok(());
     }
 
@@ -1721,12 +1774,12 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
     if dat_count == 0 {
-        println!("No DATs loaded. Run `bitshelf dat import` first.");
+        println!("No DATs loaded. Run `romshelf dat import` first.");
         return Ok(());
     }
 
     if file_count == 0 {
-        println!("No files scanned. Run `bitshelf scan` first.");
+        println!("No files scanned. Run `romshelf scan` first.");
         println!("  DATs loaded: {}", dat_count);
         println!("  DAT entries: {}", entry_count);
         return Ok(());
@@ -1839,7 +1892,7 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
         println!("------------");
 
         if misnamed_count > 0 {
-            println!("  Misnamed files:   {:>8}  <- Run `bitshelf rename --dry-run`", misnamed_count);
+            println!("  Misnamed files:   {:>8}  <- Run `romshelf rename --dry-run`", misnamed_count);
         }
 
         if unmatched_count > 0 {
@@ -1849,7 +1902,7 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
         if duplicate_groups > 0 {
             println!("  Duplicate groups: {:>8}  ({} files, {} wasted)",
                 duplicate_groups, duplicate_files, format_bytes(wasted_bytes));
-            println!("                             <- Run `bitshelf duplicates --details`");
+            println!("                             <- Run `romshelf duplicates --details`");
         }
 
         if empty_dats > 0 {
@@ -1866,15 +1919,15 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
     println!("-----------------");
 
     if misnamed_count > 0 {
-        println!("  1. Fix misnamed files:  bitshelf rename --dry-run");
+        println!("  1. Fix misnamed files:  romshelf rename --dry-run");
     }
 
     if missing_count > 0 && verified_pct < 100.0 {
-        println!("  {}. Find missing ROMs:    bitshelf verify --issues", if misnamed_count > 0 { "2" } else { "1" });
+        println!("  {}. Find missing ROMs:    romshelf verify --issues", if misnamed_count > 0 { "2" } else { "1" });
     }
 
     if duplicate_groups > 0 {
-        println!("  {}. Review duplicates:    bitshelf duplicates --details",
+        println!("  {}. Review duplicates:    romshelf duplicates --details",
             if misnamed_count > 0 && missing_count > 0 { "3" } else if misnamed_count > 0 || missing_count > 0 { "2" } else { "1" });
     }
 
