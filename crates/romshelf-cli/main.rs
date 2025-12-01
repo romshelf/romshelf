@@ -1,20 +1,32 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
+use serde_json::json;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use romshelf_core::dat;
 use romshelf_core::db;
 use romshelf_core::scan::{self, ScanProgress};
+use romshelf_core::services::dat_importer::{DatImportOptions, DatImportOutcome, DatImporter};
+use romshelf_core::services::progress::{DatImportEvent, ProgressSink, ScanEvent};
 use romshelf_core::tosec;
 use romshelf_core::verify;
 
 /// A matched file ready for organisation
 /// (source_path, filename, rom_name, dat_name, set_name, category)
-type MatchedFile = (PathBuf, String, String, String, Option<String>, Option<String>);
+type MatchedFile = (
+    PathBuf,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Parser)]
 #[command(name = "romshelf")]
@@ -23,6 +35,10 @@ struct Cli {
     /// Show verbose progress (current file, archives being opened, etc.)
     #[arg(long, short = 'v', global = true)]
     verbose: bool,
+
+    /// Emit progress events as JSON instead of interactive text
+    #[arg(long, global = true, default_value_t = false)]
+    progress_json: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -147,34 +163,73 @@ fn main() -> Result<()> {
 
     // Get database path
     let db_path = get_db_path()?;
-    let conn = db::init_db(&db_path)?;
+    let mut conn = db::init_db(&db_path)?;
 
     let verbose = cli.verbose;
+    let progress_sink = CliProgressSink::new(cli.progress_json);
 
     match cli.command {
         Commands::Dat { command } => match command {
-            DatCommands::Import { path, category } => cmd_dat_import(&conn, &path, category.as_deref()),
-            DatCommands::ImportDir { path, prefix } => cmd_dat_import_dir(&conn, &path, prefix.as_deref(), verbose),
-            DatCommands::List { category, search } => cmd_dat_list(&conn, category.as_deref(), search.as_deref()),
+            DatCommands::Import { path, category } => cmd_dat_import(
+                &mut conn,
+                path.as_path(),
+                category.as_deref(),
+                progress_sink.clone(),
+            ),
+            DatCommands::ImportDir { path, prefix } => cmd_dat_import_dir(
+                &mut conn,
+                &path,
+                prefix.as_deref(),
+                verbose,
+                progress_sink.clone(),
+            ),
+            DatCommands::List { category, search } => {
+                cmd_dat_list(&conn, category.as_deref(), search.as_deref())
+            }
             DatCommands::Info { dat } => cmd_dat_info(&conn, &dat),
             DatCommands::Remove { dat, yes, dry_run } => cmd_dat_remove(&conn, &dat, yes, dry_run),
         },
-        Commands::Scan { path, threads, prune } => {
+        Commands::Scan {
+            path,
+            threads,
+            prune,
+        } => {
             if prune {
                 cmd_prune(&conn, verbose)
             } else if let Some(path) = path {
-                cmd_scan(&conn, &path, threads, verbose)
+                cmd_scan(
+                    &conn,
+                    &path,
+                    threads,
+                    verbose,
+                    cli.progress_json,
+                    progress_sink.clone(),
+                )
             } else {
                 eprintln!("Error: Path required unless using --prune");
                 std::process::exit(1);
             }
         }
         Commands::Verify { issues } => cmd_verify(&conn, issues),
-        Commands::Organise { target, dry_run, copy, loose, zip_per_dat, rename_only } => {
+        Commands::Organise {
+            target,
+            dry_run,
+            copy,
+            loose,
+            zip_per_dat,
+            rename_only,
+        } => {
             if rename_only {
                 cmd_rename_in_place(&conn, dry_run)
             } else {
-                cmd_organise(&conn, target.as_ref().unwrap(), dry_run, copy, loose, zip_per_dat)
+                cmd_organise(
+                    &conn,
+                    target.as_ref().unwrap(),
+                    dry_run,
+                    copy,
+                    loose,
+                    zip_per_dat,
+                )
             }
         }
         Commands::Stats => cmd_stats(&conn),
@@ -192,22 +247,51 @@ fn get_db_path() -> Result<PathBuf> {
 
 /// Import result for tracking duplicates
 enum ImportResult {
-    Imported { name: String, version: Option<String>, entries: usize },
-    Duplicate { name: String },
-    Failed { path: PathBuf, error: String },
+    Imported {
+        name: String,
+        version: Option<String>,
+        entries: usize,
+        duration: Duration,
+        entries_per_sec: f64,
+    },
+    Duplicate {
+        name: String,
+    },
+    Unchanged {
+        name: String,
+    },
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
-fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf, category: Option<&str>) -> Result<()> {
-    match import_single_dat(conn, path, category)? {
-        ImportResult::Imported { name, version, entries } => {
+fn cmd_dat_import(
+    conn: &mut rusqlite::Connection,
+    path: &Path,
+    category: Option<&str>,
+    progress_sink: CliProgressSink,
+) -> Result<()> {
+    match import_single_dat(conn, path, category, None, progress_sink.clone())? {
+        ImportResult::Imported {
+            name,
+            version,
+            entries,
+            duration,
+            entries_per_sec,
+        } => {
             println!("Imported: {}", name);
             if let Some(v) = version {
                 println!("  Version: {}", v);
             }
-            println!("  Entries: {}", entries);
+            println!("  Entries: {} ({:.1} per second)", entries, entries_per_sec);
+            println!("  Duration: {:.2}s", duration.as_secs_f64());
         }
         ImportResult::Duplicate { name } => {
             println!("Skipped (duplicate): {}", name);
+        }
+        ImportResult::Unchanged { name } => {
+            println!("Skipped (unchanged): {}", name);
         }
         ImportResult::Failed { path, error } => {
             eprintln!("Failed to import {}: {}", path.display(), error);
@@ -216,13 +300,23 @@ fn cmd_dat_import(conn: &rusqlite::Connection, path: &PathBuf, category: Option<
     Ok(())
 }
 
-fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&str>, verbose: bool) -> Result<()> {
+fn cmd_dat_import_dir(
+    conn: &mut rusqlite::Connection,
+    path: &Path,
+    prefix: Option<&str>,
+    verbose: bool,
+    progress_sink: CliProgressSink,
+) -> Result<()> {
     use walkdir::WalkDir;
 
     eprintln!("Scanning for DAT files in {}...", path.display());
 
     // Canonicalize the base path for reliable relative path calculation
     let base_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    if verbose && !progress_sink.is_json() {
+        eprintln!("  Scanning directories...");
+    }
 
     let dat_files: Vec<PathBuf> = WalkDir::new(path)
         .follow_links(true)
@@ -232,13 +326,15 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
             e.file_type().is_file()
                 && e.path()
                     .extension()
-                    .map(|ext| {
-                        ext.eq_ignore_ascii_case("dat") || ext.eq_ignore_ascii_case("xml")
-                    })
+                    .map(|ext| ext.eq_ignore_ascii_case("dat") || ext.eq_ignore_ascii_case("xml"))
                     .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
         .collect();
+
+    if verbose && !progress_sink.is_json() {
+        eprintln!("  Scanning directories...");
+    }
 
     eprintln!("Found {} DAT files", dat_files.len());
 
@@ -248,23 +344,33 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
 
     for (i, dat_path) in dat_files.iter().enumerate() {
         if verbose {
-            // Show full DAT path in verbose mode
-            let display_name = dat_path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            eprint!("\r  [{:>4}/{:>4}] {}{}",
-                i + 1, dat_files.len(), display_name,
-                " ".repeat(60usize.saturating_sub(display_name.len()))
-            );
-        } else {
-            eprint!("\r  Processing: {}/{}", i + 1, dat_files.len());
+            if !progress_sink.is_json() {
+                // Show full DAT path in verbose mode
+                let display_name = dat_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                eprint!(
+                    "\r\x1b[2K  [{:>4}/{:>4}] {}{}",
+                    i + 1,
+                    dat_files.len(),
+                    display_name,
+                    " ".repeat(60usize.saturating_sub(display_name.len()))
+                );
+            }
+        } else if !progress_sink.is_json() {
+            eprint!("\r\x1b[2K  Processing: {}/{}", i + 1, dat_files.len());
         }
 
         // Compute category from relative path (parent directory of DAT file)
         // Use prefix if provided, otherwise use the base folder name
         let category_root = prefix
             .map(|p| p.to_string())
-            .or_else(|| base_path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .or_else(|| {
+                base_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
             .unwrap_or_default();
 
         // Try TOSEC filename parsing first - this gives us proper manufacturer/platform paths
@@ -279,7 +385,12 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
             .canonicalize()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .and_then(|parent| parent.strip_prefix(&base_path).ok().map(|p| p.to_path_buf()))
+            .and_then(|parent| {
+                parent
+                    .strip_prefix(&base_path)
+                    .ok()
+                    .map(|p| p.to_path_buf())
+            })
             .map(|rel_path| {
                 let rel_str = rel_path.to_string_lossy();
                 if rel_str.is_empty() {
@@ -293,9 +404,16 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
         // Prefer TOSEC filename parsing, then directory structure
         let category = tosec_category.or(dir_category);
 
-        match import_single_dat(conn, dat_path, category.as_deref()) {
+        match import_single_dat(
+            conn,
+            dat_path,
+            category.as_deref(),
+            Some(base_path.as_path()),
+            progress_sink.clone(),
+        ) {
             Ok(ImportResult::Imported { .. }) => imported += 1,
             Ok(ImportResult::Duplicate { .. }) => duplicates += 1,
+            Ok(ImportResult::Unchanged { .. }) => duplicates += 1,
             Ok(ImportResult::Failed { path, error }) => {
                 eprintln!("\n  Failed: {} - {}", path.display(), error);
                 failed += 1;
@@ -307,7 +425,9 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
         }
     }
 
-    eprintln!(); // New line after progress
+    if !progress_sink.is_json() {
+        eprintln!(); // New line after progress
+    }
     println!("\nImport complete:");
     println!("  Imported:   {:>6}", imported);
     println!("  Duplicates: {:>6}", duplicates);
@@ -318,149 +438,59 @@ fn cmd_dat_import_dir(conn: &rusqlite::Connection, path: &Path, prefix: Option<&
     Ok(())
 }
 
-fn import_single_dat(conn: &rusqlite::Connection, path: &PathBuf, category: Option<&str>) -> Result<ImportResult> {
-    // Get file metadata for mtime/size check
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+fn import_single_dat(
+    conn: &mut rusqlite::Connection,
+    path: &Path,
+    category: Option<&str>,
+    category_root: Option<&Path>,
+    progress_sink: CliProgressSink,
+) -> Result<ImportResult> {
+    let mut importer = DatImporter::new(conn, progress_sink);
+    let options = DatImportOptions {
+        category: category.map(|c| c.to_string()),
+        category_root: category_root.map(|p| p.to_path_buf()),
+    };
+    let result = match importer.import_path(path, options, |_event| {}) {
+        Ok(res) => res,
         Err(e) => {
             return Ok(ImportResult::Failed {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 error: e.to_string(),
             });
         }
     };
-
-    let file_size = metadata.len() as i64;
-    let file_mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
-
-    let path_str = path.to_string_lossy().to_string();
-
-    // Check if we already have this DAT and it hasn't changed (same path, size, mtime)
-    let existing: Option<(String, i64, Option<i64>)> = conn
-        .query_row(
-            "SELECT name, file_size, file_mtime FROM dats WHERE file_path = ?1",
-            [&path_str],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .ok();
-
-    if let Some((name, existing_size, existing_mtime)) = existing {
-        if existing_size == file_size && existing_mtime == file_mtime {
-            // File unchanged - skip re-import
-            return Ok(ImportResult::Duplicate { name });
-        }
-    }
-
-    // Hash the DAT file for duplicate detection
-    let file_sha1 = match dat::hash_dat_file(path) {
-        Ok(hash) => hash,
-        Err(e) => {
-            return Ok(ImportResult::Failed {
-                path: path.clone(),
-                error: e.to_string(),
-            });
-        }
+    let mapped = match result.outcome {
+        DatImportOutcome::Imported {
+            name,
+            entry_count,
+            entries_per_sec,
+            ..
+        } => ImportResult::Imported {
+            name,
+            version: None,
+            entries: entry_count as usize,
+            duration: result.duration,
+            entries_per_sec,
+        },
+        DatImportOutcome::Duplicate { name } => ImportResult::Duplicate { name },
+        DatImportOutcome::Unchanged { name } => ImportResult::Unchanged { name },
     };
-
-    // Check if this exact DAT already exists (by hash)
-    let exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM dats WHERE file_sha1 = ?1",
-            [&file_sha1],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-
-    if exists {
-        // Get the name for reporting
-        let name: String = conn
-            .query_row(
-                "SELECT name FROM dats WHERE file_sha1 = ?1",
-                [&file_sha1],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "Unknown".to_string());
-        return Ok(ImportResult::Duplicate { name });
-    }
-
-    // Parse the DAT
-    let parsed = match dat::parse_dat(path) {
-        Ok(p) => p,
-        Err(e) => {
-            return Ok(ImportResult::Failed {
-                path: path.clone(),
-                error: e.to_string(),
-            });
-        }
-    };
-
-    // Insert DAT record
-    conn.execute(
-        "INSERT INTO dats (name, format, file_path, file_sha1, file_size, file_mtime, category) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            &parsed.name,
-            "logiqx",
-            &path_str,
-            &file_sha1,
-            file_size,
-            file_mtime,
-            category
-        ],
-    )?;
-    let dat_id = conn.last_insert_rowid();
-
-    // Insert version record
-    let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "INSERT INTO dat_versions (dat_id, version, loaded_at, entry_count) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![dat_id, parsed.version, now, parsed.entry_count() as i64],
-    )?;
-    let version_id = conn.last_insert_rowid();
-
-    // Insert sets and their entries
-    let mut set_stmt = conn.prepare(
-        "INSERT INTO sets (dat_version_id, name) VALUES (?1, ?2)",
-    )?;
-    let mut entry_stmt = conn.prepare(
-        "INSERT INTO dat_entries (dat_version_id, set_id, name, size, crc32, md5, sha1) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-
-    for set in &parsed.sets {
-        set_stmt.execute(rusqlite::params![version_id, set.name])?;
-        let set_id = conn.last_insert_rowid();
-
-        for rom in &set.roms {
-            entry_stmt.execute(rusqlite::params![
-                version_id,
-                set_id,
-                rom.name,
-                rom.size as i64,
-                rom.crc32,
-                rom.md5,
-                rom.sha1
-            ])?;
-        }
-    }
-
-    let entry_count = parsed.entry_count();
-    Ok(ImportResult::Imported {
-        name: parsed.name,
-        version: parsed.version,
-        entries: entry_count,
-    })
+    Ok(mapped)
 }
 
-fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, search_filter: Option<&str>) -> Result<()> {
+type DatListRow = (i64, String, Option<String>, Option<String>, i64, String);
+
+fn cmd_dat_list(
+    conn: &rusqlite::Connection,
+    category_filter: Option<&str>,
+    search_filter: Option<&str>,
+) -> Result<()> {
     // Build query with optional filters
     let mut sql = String::from(
         "SELECT d.id, d.name, d.category, dv.version, dv.entry_count, dv.loaded_at
          FROM dats d
          JOIN dat_versions dv ON d.id = dv.dat_id
-         WHERE 1=1"
+         WHERE 1=1",
     );
 
     if category_filter.is_some() {
@@ -468,7 +498,11 @@ fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, sear
     }
 
     if search_filter.is_some() {
-        let param_num = if category_filter.is_some() { "?2" } else { "?1" };
+        let param_num = if category_filter.is_some() {
+            "?2"
+        } else {
+            "?1"
+        };
         sql.push_str(&format!(" AND d.name LIKE '%' || {} || '%'", param_num));
     }
 
@@ -476,27 +510,59 @@ fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, sear
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let rows: Vec<(i64, String, Option<String>, Option<String>, i64, String)> = match (category_filter, search_filter) {
-        (Some(cat), Some(search)) => {
-            stmt.query_map([cat, search], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-            })?.filter_map(|r| r.ok()).collect()
-        }
-        (Some(cat), None) => {
-            stmt.query_map([cat], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-            })?.filter_map(|r| r.ok()).collect()
-        }
-        (None, Some(search)) => {
-            stmt.query_map([search], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-            })?.filter_map(|r| r.ok()).collect()
-        }
-        (None, None) => {
-            stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-            })?.filter_map(|r| r.ok()).collect()
-        }
+    let rows: Vec<DatListRow> = match (category_filter, search_filter) {
+        (Some(cat), Some(search)) => stmt
+            .query_map([cat, search], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect(),
+        (Some(cat), None) => stmt
+            .query_map([cat], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect(),
+        (None, Some(search)) => stmt
+            .query_map([search], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect(),
+        (None, None) => stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect(),
     };
 
     let count = rows.len();
@@ -531,7 +597,8 @@ fn cmd_dat_list(conn: &rusqlite::Connection, category_filter: Option<&str>, sear
 fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
     // Try to find by ID first, then by name
     let dat_id: Option<i64> = dat_ref.parse().ok().and_then(|id: i64| {
-        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0)).ok()
+        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0))
+            .ok()
     });
 
     let dat_id = match dat_id {
@@ -551,7 +618,10 @@ fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
                 }
                 1 => matches[0].0,
                 _ => {
-                    println!("Multiple DATs match '{}'. Please be more specific:", dat_ref);
+                    println!(
+                        "Multiple DATs match '{}'. Please be more specific:",
+                        dat_ref
+                    );
                     for (id, name) in &matches {
                         println!("  [{}] {}", id, name);
                     }
@@ -562,16 +632,31 @@ fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
     };
 
     // Get DAT details
-    let (name, format, file_path, category, file_size, file_mtime): (String, String, String, Option<String>, Option<i64>, Option<i64>) =
-        conn.query_row(
-            "SELECT name, format, file_path, category, file_size, file_mtime FROM dats WHERE id = ?1",
-            [dat_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-        )?;
+    let (name, format, file_path, category, file_size, file_mtime): (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT name, format, file_path, category, file_size, file_mtime FROM dats WHERE id = ?1",
+        [dat_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
 
     // Get version details
-    let (version_id, version, loaded_at, entry_count): (i64, Option<String>, String, i64) =
-        conn.query_row(
+    let (version_id, version, loaded_at, entry_count): (i64, Option<String>, String, i64) = conn
+        .query_row(
             "SELECT id, version, loaded_at, entry_count FROM dat_versions WHERE dat_id = ?1",
             [dat_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -628,17 +713,26 @@ fn cmd_dat_info(conn: &rusqlite::Connection, dat_ref: &str) -> Result<()> {
     } else {
         0.0
     };
-    println!("  Matched:    {:>8} / {} ({:.1}%)", matched_count, entry_count, pct);
+    println!(
+        "  Matched:    {:>8} / {} ({:.1}%)",
+        matched_count, entry_count, pct
+    );
     println!("  Missing:    {:>8}", entry_count - matched_count);
 
     Ok(())
 }
 
 /// Remove a DAT and all its entries
-fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool, dry_run: bool) -> Result<()> {
+fn cmd_dat_remove(
+    conn: &rusqlite::Connection,
+    dat_ref: &str,
+    skip_confirm: bool,
+    dry_run: bool,
+) -> Result<()> {
     // Try to find by ID first, then by name
     let dat_id: Option<i64> = dat_ref.parse().ok().and_then(|id: i64| {
-        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0)).ok()
+        conn.query_row("SELECT id FROM dats WHERE id = ?1", [id], |row| row.get(0))
+            .ok()
     });
 
     let dat_id = match dat_id {
@@ -658,7 +752,10 @@ fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool
                 }
                 1 => matches[0].0,
                 _ => {
-                    println!("Multiple DATs match '{}'. Please be more specific:", dat_ref);
+                    println!(
+                        "Multiple DATs match '{}'. Please be more specific:",
+                        dat_ref
+                    );
                     for (id, name) in &matches {
                         println!("  [{}] {}", id, name);
                     }
@@ -742,10 +839,8 @@ fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool
         [version_id],
     )?;
 
-    let sets_deleted: usize = conn.execute(
-        "DELETE FROM sets WHERE dat_version_id = ?1",
-        [version_id],
-    )?;
+    let sets_deleted: usize =
+        conn.execute("DELETE FROM sets WHERE dat_version_id = ?1", [version_id])?;
 
     conn.execute("DELETE FROM dat_versions WHERE id = ?1", [version_id])?;
     conn.execute("DELETE FROM dats WHERE id = ?1", [dat_id])?;
@@ -760,8 +855,27 @@ fn cmd_dat_remove(conn: &rusqlite::Connection, dat_ref: &str, skip_confirm: bool
     Ok(())
 }
 
-fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, verbose: bool) -> Result<()> {
+fn cmd_scan(
+    conn: &rusqlite::Connection,
+    path: &Path,
+    threads: Option<usize>,
+    verbose: bool,
+    json_progress: bool,
+    progress_sink: CliProgressSink,
+) -> Result<()> {
     let thread_count = threads.unwrap_or_else(num_cpus::get).max(1);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    if !json_progress {
+        eprintln!("  Press Enter to stop the scan gracefully...");
+        let cancel_clone = cancel_flag.clone();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut handle = stdin.lock();
+            let mut line = String::new();
+            let _ = handle.read_line(&mut line);
+            cancel_clone.store(true, Ordering::SeqCst);
+        });
+    }
 
     // Load existing files from database for incremental scan
     let existing_files: std::collections::HashMap<String, (i64, Option<i64>)> = {
@@ -777,150 +891,201 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
     };
 
     let existing_count = existing_files.len();
-    if existing_count > 0 {
-        eprintln!(
-            "Scanning {} with {} threads ({} files in database)...",
-            path.display(),
-            thread_count,
-            existing_count
-        );
-    } else {
-        eprintln!("Scanning {} with {} threads...", path.display(), thread_count);
+    if !json_progress {
+        if existing_count > 0 {
+            eprintln!(
+                "Scanning {} with {} threads ({} files in database)...",
+                path.display(),
+                thread_count,
+                existing_count
+            );
+        } else {
+            eprintln!(
+                "Scanning {} with {} threads...",
+                path.display(),
+                thread_count
+            );
+        }
+        eprintln!("  Discovering directories and files...");
     }
 
-    let progress = Arc::new(ScanProgress::new());
+    let progress = if json_progress {
+        let sink: Arc<dyn ProgressSink<ScanEvent>> = Arc::new(progress_sink.clone());
+        Arc::new(ScanProgress::with_sink(sink))
+    } else {
+        Arc::new(ScanProgress::new())
+    };
     let progress_display = Arc::clone(&progress);
 
     // Progress display thread
-    let display_handle = thread::spawn(move || {
-        let mut last_line_count = 0usize;
+    let display_handle = if json_progress {
+        None
+    } else {
+        let cancel_for_display = cancel_flag.clone();
+        Some(thread::spawn(move || {
+            let mut last_line_count = 0usize;
 
-        loop {
-            let discovered = progress_display.discovered.load(Ordering::Relaxed);
-            let processed = progress_display.processed.load(Ordering::Relaxed);
-            let bytes_sec = progress_display.bytes_per_sec();
-
-            if verbose {
-                // Clear previous lines if we printed multiple
-                if last_line_count > 0 {
-                    // Move cursor up and clear each line
-                    for _ in 0..last_line_count {
-                        eprint!("\x1b[A\x1b[2K"); // Move up, clear line
-                    }
-                }
-                eprint!("\r\x1b[2K"); // Clear current line
-
-                // Get all active files (sorted by size, largest first)
-                let active_files = progress_display.get_active_files();
-                let file_count = active_files.len();
-
-                // Extract unique directories currently being processed
-                let active_dirs: std::collections::HashSet<String> = active_files
-                    .iter()
-                    .filter_map(|f| {
-                        // Handle archive paths: /path/to/archive.zip#entry -> /path/to
-                        let base_path = if let Some(hash_pos) = f.path.rfind('#') {
-                            &f.path[..hash_pos]
-                        } else {
-                            &f.path
-                        };
-                        // Get parent directory
-                        std::path::Path::new(base_path)
-                            .parent()
-                            .map(|p| p.to_string_lossy().to_string())
-                    })
-                    .collect();
-
-                // Show current directory (most common among active files, or first alphabetically)
-                let current_dir = active_dirs.iter().min().cloned().unwrap_or_default();
-                let display_dir = if current_dir.len() > 60 {
-                    format!("...{}", &current_dir[current_dir.len()-57..])
+            loop {
+                let discovered = progress_display.discovered.load(Ordering::Relaxed);
+                let processed = progress_display.processed.load(Ordering::Relaxed);
+                let bytes_sec = progress_display.bytes_per_sec();
+                let elapsed = progress_display.start_time.elapsed().as_secs_f64();
+                let files_per_sec = if elapsed > 0.0 {
+                    processed as f64 / elapsed
                 } else {
-                    current_dir
+                    0.0
+                };
+                let eta_text = if files_per_sec > 0.0 && discovered > processed {
+                    Some(format_eta(
+                        ((discovered - processed) as f64) / files_per_sec,
+                    ))
+                } else {
+                    None
                 };
 
-                // Header line with overall progress and current directory
-                eprintln!(
-                    "  [{:>6}/{:>6}] {:>8}/s  {} workers  {}",
-                    processed, discovered,
-                    format_bytes_short(bytes_sec as i64),
-                    file_count,
-                    display_dir
-                );
+                if verbose {
+                    // Clear previous lines if we printed multiple
+                    if last_line_count > 0 {
+                        // Move cursor up and clear each line
+                        for _ in 0..last_line_count {
+                            eprint!("\x1b[A\x1b[2K"); // Move up, clear line
+                        }
+                    }
+                    eprint!("\r\x1b[2K"); // Clear current line
 
-                // Show up to 8 active files with progress bars
-                let max_display = 8.min(file_count);
-                for (i, file_prog) in active_files.iter().take(max_display).enumerate() {
-                    // Extract just the filename (after # for archives, or last path component)
-                    let display_name = if let Some(hash_pos) = file_prog.path.rfind('#') {
-                        &file_prog.path[hash_pos + 1..]
+                    // Get all active files (sorted by size, largest first)
+                    let active_files = progress_display.get_active_files();
+                    let file_count = active_files.len();
+
+                    // Extract unique directories currently being processed
+                    let active_dirs: std::collections::HashSet<String> = active_files
+                        .iter()
+                        .filter_map(|f| {
+                            // Handle archive paths: /path/to/archive.zip#entry -> /path/to
+                            let base_path = if let Some(hash_pos) = f.path.rfind('#') {
+                                &f.path[..hash_pos]
+                            } else {
+                                &f.path
+                            };
+                            // Get parent directory
+                            std::path::Path::new(base_path)
+                                .parent()
+                                .map(|p| p.to_string_lossy().to_string())
+                        })
+                        .collect();
+
+                    // Show current directory (most common among active files, or first alphabetically)
+                    let current_dir = active_dirs.iter().min().cloned().unwrap_or_default();
+                    let display_dir = if current_dir.len() > 60 {
+                        format!("...{}", &current_dir[current_dir.len() - 57..])
                     } else {
-                        file_prog.path.rsplit('/').next().unwrap_or(&file_prog.path)
+                        current_dir
                     };
 
-                    // Truncate if too long (allow up to 80 chars for filename)
-                    let display_name = if display_name.len() > 80 {
-                        format!("...{}", &display_name[display_name.len()-77..])
-                    } else {
-                        display_name.to_string()
-                    };
-
-                    // Calculate progress percentage
-                    let pct = if file_prog.size > 0 {
-                        ((file_prog.bytes_done as f64 / file_prog.size as f64) * 100.0).min(100.0)
-                    } else {
-                        0.0
-                    };
-
-                    // Tree-style prefix
-                    let prefix = if i == max_display - 1 { "└" } else { "├" };
-
-                    // Size display
-                    let size_str = format_bytes_short(file_prog.size as i64);
-
+                    // Header line with overall progress and current directory
+                    let eta_suffix = eta_text
+                        .as_ref()
+                        .map(|eta| format!("  ETA {}", eta))
+                        .unwrap_or_default();
                     eprintln!(
-                        "    {} {:>6} {:>3.0}%  {}",
-                        prefix, size_str, pct, display_name
+                        "  [{:>6}/{:>6}] {:>8}/s  {} workers  {}{}",
+                        processed,
+                        discovered,
+                        format_bytes_short(bytes_sec as i64),
+                        file_count,
+                        display_dir,
+                        eta_suffix
+                    );
+
+                    // Show up to 8 active files with progress bars
+                    let max_display = 8.min(file_count);
+                    for (i, file_prog) in active_files.iter().take(max_display).enumerate() {
+                        // Extract just the filename (after # for archives, or last path component)
+                        let display_name = if let Some(hash_pos) = file_prog.path.rfind('#') {
+                            &file_prog.path[hash_pos + 1..]
+                        } else {
+                            file_prog.path.rsplit('/').next().unwrap_or(&file_prog.path)
+                        };
+
+                        // Truncate if too long (allow up to 80 chars for filename)
+                        let display_name = if display_name.len() > 80 {
+                            format!("...{}", &display_name[display_name.len() - 77..])
+                        } else {
+                            display_name.to_string()
+                        };
+
+                        // Calculate progress percentage
+                        let pct = if file_prog.size > 0 {
+                            ((file_prog.bytes_done as f64 / file_prog.size as f64) * 100.0)
+                                .min(100.0)
+                        } else {
+                            0.0
+                        };
+
+                        // Tree-style prefix
+                        let prefix = if i == max_display - 1 { "└" } else { "├" };
+
+                        // Size display
+                        let size_str = format_bytes_short(file_prog.size as i64);
+
+                        eprintln!(
+                            "    {} {:>6} {:>3.0}%  {}",
+                            prefix, size_str, pct, display_name
+                        );
+                    }
+
+                    // Track how many lines we printed (1 header + file lines)
+                    last_line_count = 1 + max_display;
+
+                    // If there are more files, show count
+                    if file_count > max_display {
+                        eprintln!("    ... and {} more", file_count - max_display);
+                        last_line_count += 1;
+                    }
+                } else {
+                    let eta_suffix = eta_text
+                        .as_ref()
+                        .map(|eta| format!("  ETA {}", eta))
+                        .unwrap_or_default();
+                    eprint!(
+                        "\r\x1b[2K  Discovered: {:>6}  Processed: {:>6}  Speed: {:>8}/s{}",
+                        discovered,
+                        processed,
+                        format_bytes_short(bytes_sec as i64),
+                        eta_suffix
                     );
                 }
 
-                // Track how many lines we printed (1 header + file lines)
-                last_line_count = 1 + max_display;
-
-                // If there are more files, show count
-                if file_count > max_display {
-                    eprintln!("    ... and {} more", file_count - max_display);
-                    last_line_count += 1;
+                // Check if we're done (processed >= discovered and discovered > 0)
+                if processed >= discovered && discovered > 0 {
+                    // Give a small grace period for final items
+                    thread::sleep(Duration::from_millis(100));
+                    let final_processed = progress_display.processed.load(Ordering::Relaxed);
+                    let final_discovered = progress_display.discovered.load(Ordering::Relaxed);
+                    if final_processed >= final_discovered {
+                        break;
+                    }
                 }
-            } else {
-                eprint!(
-                    "\r  Discovered: {:>6}  Processed: {:>6}  Speed: {:>8}/s  ",
-                    discovered, processed,
-                    format_bytes_short(bytes_sec as i64)
-                );
-            }
 
-            // Check if we're done (processed >= discovered and discovered > 0)
-            if processed >= discovered && discovered > 0 {
-                // Give a small grace period for final items
-                thread::sleep(Duration::from_millis(100));
-                let final_processed = progress_display.processed.load(Ordering::Relaxed);
-                let final_discovered = progress_display.discovered.load(Ordering::Relaxed);
-                if final_processed >= final_discovered {
+                if cancel_for_display.load(Ordering::Relaxed) {
+                    eprintln!("\nCancellation requested. Finishing current files...");
                     break;
                 }
-            }
 
-            thread::sleep(Duration::from_millis(100));
-        }
-        eprintln!(); // New line after progress
-    });
+                thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!(); // New line after progress
+        }))
+    };
 
     // Run the scan
-    let result = scan::scan_directory_parallel(path, thread_count, progress)?;
+    let result =
+        scan::scan_directory_parallel(path, thread_count, progress, Some(cancel_flag.clone()))?;
 
     // Wait for progress display to finish
-    let _ = display_handle.join();
+    if let Some(handle) = display_handle {
+        let _ = handle.join();
+    }
 
     // Track paths we've seen (for detecting missing files)
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -939,15 +1104,13 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
     let mut updated_files = 0;
     let mut unchanged_files = 0;
 
-    for file in &result.files {
+    for file in result.files.iter() {
         let path_str = file.path.to_string_lossy().to_string();
         seen_paths.insert(path_str.clone());
 
         // Check if file is unchanged (same size and mtime)
         if let Some(&(existing_size, existing_mtime)) = existing_files.get(&path_str) {
-            if existing_size == file.size as i64
-                && existing_mtime == file.mtime
-            {
+            if existing_size == file.size as i64 && existing_mtime == file.mtime {
                 // File unchanged - skip updating (but track it as seen)
                 unchanged_files += 1;
                 continue;
@@ -958,7 +1121,9 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
         }
 
         // Get or create directory entry
-        let dir_path = file.path.parent()
+        let dir_path = file
+            .path
+            .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
@@ -997,15 +1162,32 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
     }
 
     // Print summary
-    let bytes_per_sec = if result.duration.as_secs_f64() > 0.0 {
-        result.total_bytes as f64 / result.duration.as_secs_f64()
+    let duration_secs = result.duration.as_secs_f64();
+    let bytes_per_sec = if duration_secs > 0.0 {
+        result.total_bytes as f64 / duration_secs
     } else {
         result.total_bytes as f64
     };
+    let files_per_sec = if duration_secs > 0.0 {
+        result.files.len() as f64 / duration_secs
+    } else {
+        0.0
+    };
 
-    println!("\nScan complete in {:.1}s", result.duration.as_secs_f32());
+    println!(
+        "\nScan {} in {:.1}s",
+        if cancel_flag.load(Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "complete"
+        },
+        result.duration.as_secs_f32()
+    );
     println!("  Files:      {:>6}", result.files.len());
-    println!("  Data:       {:>6}", format_bytes(result.total_bytes as i64));
+    println!(
+        "  Data:       {:>6}",
+        format_bytes(result.total_bytes as i64)
+    );
 
     if existing_count > 0 {
         println!("  New:        {:>6}", new_files);
@@ -1028,14 +1210,27 @@ fn cmd_scan(conn: &rusqlite::Connection, path: &Path, threads: Option<usize>, ve
         println!("  Skipped:    {:>6}", result.skipped.len());
     }
 
-    println!("  Speed:      {:>6}/s", format_bytes(bytes_per_sec as i64));
+    println!(
+        "  Throughput: {:>6.1} files/s, {}/s",
+        files_per_sec,
+        format_bytes(bytes_per_sec as i64)
+    );
 
     // Show skipped files if any
     if !result.skipped.is_empty() {
         println!("\nSkipped files:");
-        for skip in &result.skipped {
-            println!("  {} ({})", skip.path.display(), skip.reason);
+        for skipped in result.skipped.iter().take(20) {
+            println!("  {} ({})", skipped.path.display(), skipped.reason);
         }
+        if result.skipped.len() > 20 {
+            println!("  ... and {} more", result.skipped.len() - 20);
+        }
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        println!(
+            "\nScan stopped early. Run the same command again to continue scanning remaining directories."
+        );
     }
 
     // Recompute directory statistics (rollup from files to directories)
@@ -1108,7 +1303,8 @@ fn cmd_prune(conn: &rusqlite::Connection, verbose: bool) -> Result<()> {
 
 fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
     // Load files from database
-    let mut file_stmt = conn.prepare("SELECT path, filename, size, mtime, crc32, md5, sha1 FROM files")?;
+    let mut file_stmt =
+        conn.prepare("SELECT path, filename, size, mtime, crc32, md5, sha1 FROM files")?;
     let files: Vec<scan::ScannedFile> = file_stmt
         .query_map([], |row| {
             Ok(scan::ScannedFile {
@@ -1161,10 +1357,7 @@ fn cmd_verify(conn: &rusqlite::Connection, show_issues: bool) -> Result<()> {
     let mut entries_by_dat: std::collections::HashMap<String, Vec<dat::DatEntry>> =
         std::collections::HashMap::new();
     for (entry, dat_name) in all_entries {
-        entries_by_dat
-            .entry(dat_name)
-            .or_default()
-            .push(entry);
+        entries_by_dat.entry(dat_name).or_default().push(entry);
     }
 
     // Track all misnamed and unmatched for detailed output
@@ -1234,7 +1427,6 @@ fn cmd_organise(
     loose: bool,
     zip_per_dat: bool,
 ) -> Result<()> {
-
     // Load all matched files with their DAT and set info
     // Include category for directory structure
     let mut stmt = conn.prepare(
@@ -1292,12 +1484,7 @@ fn cmd_organise(
 }
 
 /// Organise files as loose files
-fn organise_loose(
-    matches: &[MatchedFile],
-    target: &Path,
-    dry_run: bool,
-    copy: bool,
-) -> Result<()> {
+fn organise_loose(matches: &[MatchedFile], target: &Path, dry_run: bool, copy: bool) -> Result<()> {
     let mut organised = 0;
     let mut skipped = 0;
     let mut errors = 0;
@@ -1305,30 +1492,29 @@ fn organise_loose(
 
     for (source_path, _filename, rom_name, _dat_name, set_name, category) in matches {
         // Handle archive paths (archive.zip#entry.rom)
-        let (actual_source, target_filename) = if let Some(hash_pos) =
-            source_path.to_string_lossy().find('#')
-        {
-            // File is inside an archive - organise the archive itself
-            let archive_path_str = &source_path.to_string_lossy()[..hash_pos];
-            let archive_path = PathBuf::from(archive_path_str);
+        let (actual_source, target_filename) =
+            if let Some(hash_pos) = source_path.to_string_lossy().find('#') {
+                // File is inside an archive - organise the archive itself
+                let archive_path_str = &source_path.to_string_lossy()[..hash_pos];
+                let archive_path = PathBuf::from(archive_path_str);
 
-            // Skip if we've already processed this archive
-            if seen_archives.contains(&archive_path) {
-                continue;
-            }
-            seen_archives.insert(archive_path.clone());
+                // Skip if we've already processed this archive
+                if seen_archives.contains(&archive_path) {
+                    continue;
+                }
+                seen_archives.insert(archive_path.clone());
 
-            // Use the archive filename, keeping the extension
-            let archive_filename = archive_path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown.zip".to_string());
+                // Use the archive filename, keeping the extension
+                let archive_filename = archive_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown.zip".to_string());
 
-            (archive_path, archive_filename)
-        } else {
-            // Loose file - use the ROM name from the DAT
-            (source_path.clone(), rom_name.clone())
-        };
+                (archive_path, archive_filename)
+            } else {
+                // Loose file - use the ROM name from the DAT
+                (source_path.clone(), rom_name.clone())
+            };
 
         // Create target path: target/category/[set_name/]filename
         // Category is the directory path like "CPC/Games/[DSK]"
@@ -1484,9 +1670,11 @@ fn organise_zip_per_dat(
     for (source_path, _filename, rom_name, dat_name, set_name, category) in matches {
         let cat = category.clone().unwrap_or_default();
         let dat_key = (cat, dat_name.clone());
-        dats.entry(dat_key)
-            .or_default()
-            .push((source_path.clone(), rom_name.clone(), set_name.clone()));
+        dats.entry(dat_key).or_default().push((
+            source_path.clone(),
+            rom_name.clone(),
+            set_name.clone(),
+        ));
     }
 
     let mut archives_created = 0;
@@ -1617,10 +1805,27 @@ fn extract_file_from_archive(archive_path: &PathBuf, entry_name: &str) -> Result
     }
 }
 
-fn print_organise_summary(organised: usize, skipped: usize, errors: usize, dry_run: bool, copy: bool) {
+fn print_organise_summary(
+    organised: usize,
+    skipped: usize,
+    errors: usize,
+    dry_run: bool,
+    copy: bool,
+) {
     println!();
-    println!("{}:", if dry_run { "Would organise" } else { "Organised" });
-    println!("  {}: {:>6}", if copy { "Copied" } else { "Moved" }, organised);
+    println!(
+        "{}:",
+        if dry_run {
+            "Would organise"
+        } else {
+            "Organised"
+        }
+    );
+    println!(
+        "  {}: {:>6}",
+        if copy { "Copied" } else { "Moved" },
+        organised
+    );
     if skipped > 0 {
         println!("  Skipped:  {:>6}", skipped);
     }
@@ -1642,7 +1847,8 @@ fn sanitise_path(name: &str) -> String {
 fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     // Get DAT counts
     let dat_count: i64 = conn.query_row("SELECT COUNT(*) FROM dats", [], |row| row.get(0))?;
-    let entry_count: i64 = conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
+    let entry_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
     println!("Collection Summary");
@@ -1676,7 +1882,9 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     )?;
 
     let rows: Vec<(String, Option<String>, i64, i64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -1729,8 +1937,16 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
     // Sort by completeness percentage descending
     let mut sorted_rows = rows.clone();
     sorted_rows.sort_by(|a, b| {
-        let pct_a = if a.2 > 0 { a.3 as f64 / a.2 as f64 } else { 0.0 };
-        let pct_b = if b.2 > 0 { b.3 as f64 / b.2 as f64 } else { 0.0 };
+        let pct_a = if a.2 > 0 {
+            a.3 as f64 / a.2 as f64
+        } else {
+            0.0
+        };
+        let pct_b = if b.2 > 0 {
+            b.3 as f64 / b.2 as f64
+        } else {
+            0.0
+        };
         pct_b.partial_cmp(&pct_a).unwrap()
     });
 
@@ -1746,7 +1962,8 @@ fn cmd_stats(conn: &rusqlite::Connection) -> Result<()> {
         };
 
         let bar = progress_bar(pct, 20);
-        println!("  {:50} {:>5}/{:<5} {:>5.1}% {}",
+        println!(
+            "  {:50} {:>5}/{:<5} {:>5.1}% {}",
             truncate_string(name, 50),
             matched,
             total,
@@ -1770,7 +1987,8 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
 
     // Basic counts
     let dat_count: i64 = conn.query_row("SELECT COUNT(*) FROM dats", [], |row| row.get(0))?;
-    let entry_count: i64 = conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
+    let entry_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
     if dat_count == 0 {
@@ -1880,33 +2098,53 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
 
     println!("Verification Status");
     println!("-------------------");
-    println!("  Verified:         {:>8} ({:.1}%)", verified_count, verified_pct);
-    println!("  Missing:          {:>8} ({:.1}%)", missing_count, missing_pct);
+    println!(
+        "  Verified:         {:>8} ({:.1}%)",
+        verified_count, verified_pct
+    );
+    println!(
+        "  Missing:          {:>8} ({:.1}%)",
+        missing_count, missing_pct
+    );
     println!();
 
     // Issues section
-    let has_issues = misnamed_count > 0 || unmatched_count > 0 || duplicate_groups > 0 || empty_dats > 0;
+    let has_issues =
+        misnamed_count > 0 || unmatched_count > 0 || duplicate_groups > 0 || empty_dats > 0;
 
     if has_issues {
         println!("Issues Found");
         println!("------------");
 
         if misnamed_count > 0 {
-            println!("  Misnamed files:   {:>8}  <- Run `romshelf rename --dry-run`", misnamed_count);
+            println!(
+                "  Misnamed files:   {:>8}  <- Run `romshelf rename --dry-run`",
+                misnamed_count
+            );
         }
 
         if unmatched_count > 0 {
-            println!("  Unmatched files:  {:>8}  <- Not in any DAT", unmatched_count);
+            println!(
+                "  Unmatched files:  {:>8}  <- Not in any DAT",
+                unmatched_count
+            );
         }
 
         if duplicate_groups > 0 {
-            println!("  Duplicate groups: {:>8}  ({} files, {} wasted)",
-                duplicate_groups, duplicate_files, format_bytes(wasted_bytes));
+            println!(
+                "  Duplicate groups: {:>8}  ({} files, {} wasted)",
+                duplicate_groups,
+                duplicate_files,
+                format_bytes(wasted_bytes)
+            );
             println!("                             <- Run `romshelf duplicates --details`");
         }
 
         if empty_dats > 0 {
-            println!("  Empty DATs:       {:>8}  <- No matching files", empty_dats);
+            println!(
+                "  Empty DATs:       {:>8}  <- No matching files",
+                empty_dats
+            );
         }
 
         println!();
@@ -1923,12 +2161,23 @@ fn cmd_health(conn: &rusqlite::Connection) -> Result<()> {
     }
 
     if missing_count > 0 && verified_pct < 100.0 {
-        println!("  {}. Find missing ROMs:    romshelf verify --issues", if misnamed_count > 0 { "2" } else { "1" });
+        println!(
+            "  {}. Find missing ROMs:    romshelf verify --issues",
+            if misnamed_count > 0 { "2" } else { "1" }
+        );
     }
 
     if duplicate_groups > 0 {
-        println!("  {}. Review duplicates:    romshelf duplicates --details",
-            if misnamed_count > 0 && missing_count > 0 { "3" } else if misnamed_count > 0 || missing_count > 0 { "2" } else { "1" });
+        println!(
+            "  {}. Review duplicates:    romshelf duplicates --details",
+            if misnamed_count > 0 && missing_count > 0 {
+                "3"
+            } else if misnamed_count > 0 || missing_count > 0 {
+                "2"
+            } else {
+                "1"
+            }
+        );
     }
 
     if !has_issues && verified_pct == 100.0 {
@@ -1968,8 +2217,15 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
     paths.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Find max depth for calculating column width
-    let max_depth = paths.iter()
-        .map(|(p, _)| if p.is_empty() { 0 } else { p.matches('/').count() + 1 })
+    let max_depth = paths
+        .iter()
+        .map(|(p, _)| {
+            if p.is_empty() {
+                0
+            } else {
+                p.matches('/').count() + 1
+            }
+        })
         .max()
         .unwrap_or(0);
 
@@ -1977,7 +2233,11 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
     let name_col_width = 40 + (max_depth * 2);
 
     for (path, (total, matched)) in &paths {
-        let depth = if path.is_empty() { 0 } else { path.matches('/').count() + 1 };
+        let depth = if path.is_empty() {
+            0
+        } else {
+            path.matches('/').count() + 1
+        };
         let indent = "  ".repeat(depth);
         let display_name = if path.is_empty() {
             "(root)".to_string()
@@ -1993,7 +2253,8 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
 
         // Combine indent and name, then pad to fixed width
         let name_with_indent = format!("{}{}", indent, display_name);
-        println!("{:width$} {:>6}/{:<6} {:>5.1}%",
+        println!(
+            "{:width$} {:>6}/{:<6} {:>5.1}%",
             name_with_indent,
             matched,
             total,
@@ -2003,10 +2264,76 @@ fn print_category_tree(rows: &[(String, Option<String>, i64, i64)]) {
     }
 }
 
+#[derive(Clone)]
+struct CliProgressSink {
+    json: bool,
+    stderr: Arc<Mutex<()>>,
+}
+
+impl CliProgressSink {
+    fn new(json: bool) -> Self {
+        Self {
+            json,
+            stderr: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        self.json
+    }
+
+    fn emit_json<T: Serialize>(&self, stream: &str, event: &T) {
+        if !self.json {
+            return;
+        }
+
+        match serde_json::to_string(&json!({ "stream": stream, "event": event })) {
+            Ok(line) => {
+                let _guard = self.stderr.lock().unwrap();
+                eprintln!("{}", line);
+            }
+            Err(err) => {
+                let _guard = self.stderr.lock().unwrap();
+                eprintln!("{{\"stream\":\"logger\",\"error\":\"{}\"}}", err);
+            }
+        }
+    }
+}
+
+impl ProgressSink<DatImportEvent> for CliProgressSink {
+    fn emit(&self, event: DatImportEvent) {
+        self.emit_json("dat_import", &event);
+    }
+}
+
+impl ProgressSink<ScanEvent> for CliProgressSink {
+    fn emit(&self, event: ScanEvent) {
+        self.emit_json("scan", &event);
+    }
+}
+
 fn progress_bar(pct: f64, width: usize) -> String {
     let filled = ((pct / 100.0) * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
     format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn format_eta(secs: f64) -> String {
+    if !secs.is_finite() {
+        return String::new();
+    }
+    let mut total = secs.max(0.0).round() as i64;
+    let hours = total / 3600;
+    total %= 3600;
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("~{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("~{}m {}s", minutes, seconds)
+    } else {
+        format!("~{}s", seconds)
+    }
 }
 
 fn truncate_string(s: &str, max_len: usize) -> String {
@@ -2054,14 +2381,16 @@ fn cmd_duplicates(conn: &rusqlite::Connection, show_details: bool) -> Result<()>
     println!("Summary:");
     println!("  Duplicate groups:   {:>8}", total_groups);
     println!("  Total duplicates:   {:>8}", total_duplicate_files);
-    println!("  Wasted space:       {:>8}", format_bytes(total_wasted_bytes));
+    println!(
+        "  Wasted space:       {:>8}",
+        format_bytes(total_wasted_bytes)
+    );
     println!();
 
     if show_details {
         // Show each duplicate group with file paths
-        let mut path_stmt = conn.prepare(
-            "SELECT path, size FROM files WHERE sha1 = ?1 ORDER BY path",
-        )?;
+        let mut path_stmt =
+            conn.prepare("SELECT path, size FROM files WHERE sha1 = ?1 ORDER BY path")?;
 
         for (sha1, count, _) in &duplicates {
             let paths: Vec<(String, i64)> = path_stmt
@@ -2070,7 +2399,12 @@ fn cmd_duplicates(conn: &rusqlite::Connection, show_details: bool) -> Result<()>
                 .collect();
 
             if let Some((_, size)) = paths.first() {
-                println!("[{}] {} copies, {} each:", &sha1[..8], count, format_bytes(*size));
+                println!(
+                    "[{}] {} copies, {} each:",
+                    &sha1[..8],
+                    count,
+                    format_bytes(*size)
+                );
                 for (path, _) in &paths {
                     println!("  {}", path);
                 }
@@ -2082,9 +2416,8 @@ fn cmd_duplicates(conn: &rusqlite::Connection, show_details: bool) -> Result<()>
         println!("Top duplicates by wasted space (use --details for full list):");
         println!();
 
-        let mut path_stmt = conn.prepare(
-            "SELECT path FROM files WHERE sha1 = ?1 ORDER BY path LIMIT 1",
-        )?;
+        let mut path_stmt =
+            conn.prepare("SELECT path FROM files WHERE sha1 = ?1 ORDER BY path LIMIT 1")?;
 
         for (sha1, count, total_size) in duplicates.iter().take(10) {
             let size_per_file = total_size / count;
@@ -2192,7 +2525,8 @@ fn cmd_rename_in_place(conn: &rusqlite::Connection, dry_run: bool) -> Result<()>
         let path = PathBuf::from(path_str);
 
         // Build the new path (same directory, new filename)
-        let new_path = path.parent()
+        let new_path = path
+            .parent()
             .map(|p| p.join(correct_name))
             .unwrap_or_else(|| PathBuf::from(correct_name));
 
@@ -2208,7 +2542,10 @@ fn cmd_rename_in_place(conn: &rusqlite::Connection, dry_run: bool) -> Result<()>
         // Check if target already exists
         if new_path.exists() {
             if dry_run {
-                println!("  [EXISTS] {} -> {} (target exists)", current_name, correct_name);
+                println!(
+                    "  [EXISTS] {} -> {} (target exists)",
+                    current_name, correct_name
+                );
             }
             skipped += 1;
             continue;
@@ -2239,10 +2576,7 @@ fn cmd_rename_in_place(conn: &rusqlite::Connection, dry_run: bool) -> Result<()>
     }
 
     println!();
-    println!(
-        "{}:",
-        if dry_run { "Would rename" } else { "Renamed" }
-    );
+    println!("{}:", if dry_run { "Would rename" } else { "Renamed" });
     println!("  Renamed:    {:>6}", renamed);
     if skipped > 0 {
         println!("  Skipped:    {:>6}", skipped);
@@ -2253,4 +2587,3 @@ fn cmd_rename_in_place(conn: &rusqlite::Connection, dry_run: bool) -> Result<()>
 
     Ok(())
 }
-
