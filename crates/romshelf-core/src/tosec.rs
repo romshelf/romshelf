@@ -488,7 +488,7 @@ pub static TOSEC_PREFIX_MAP: phf::Map<&'static str, &'static str> = phf_map! {
 pub fn parse_tosec_category(filename: &str) -> Option<String> {
     // Remove .dat extension
     let name = filename.strip_suffix(".dat").unwrap_or(filename);
-    
+
     // Remove version suffix like "(TOSEC-v2024-07-03_CM)"
     let name = if let Some(idx) = name.rfind(" (TOSEC") {
         &name[..idx]
@@ -498,10 +498,10 @@ pub fn parse_tosec_category(filename: &str) -> Option<String> {
         name
     };
     let name = name.trim();
-    
+
     // Try to find the longest matching prefix
     let mut best_match: Option<(&str, &str)> = None;
-    
+
     for (prefix, category) in TOSEC_PREFIX_MAP.entries() {
         if name.starts_with(*prefix) {
             // Check if this is a longer match than our current best
@@ -514,21 +514,22 @@ pub fn parse_tosec_category(filename: &str) -> Option<String> {
             }
         }
     }
-    
+
     let (matched_prefix, category_prefix) = best_match?;
-    
+
     // Parse the remaining suffix (e.g., " - Games - [ADF]" -> "/Games/[ADF]")
     let rest = &name[matched_prefix.len()..];
     if rest.is_empty() {
         return Some(category_prefix.to_string());
     }
-    
+
     // Split on " - " and build category path
-    let parts: Vec<&str> = rest.split(" - ")
+    let parts: Vec<&str> = rest
+        .split(" - ")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    
+
     if parts.is_empty() {
         Some(category_prefix.to_string())
     } else {
@@ -551,7 +552,9 @@ mod tests {
     #[test]
     fn test_multi_word_manufacturer() {
         assert_eq!(
-            parse_tosec_category("Tandy Radio Shack TRS-80 Color Computer - Games - [CAS] (TOSEC-v2024).dat"),
+            parse_tosec_category(
+                "Tandy Radio Shack TRS-80 Color Computer - Games - [CAS] (TOSEC-v2024).dat"
+            ),
             Some("Tandy Radio Shack/TRS-80 Color Computer/Games/[CAS]".to_string())
         );
     }
@@ -566,18 +569,16 @@ mod tests {
 
     #[test]
     fn test_unknown_prefix() {
-        assert_eq!(
-            parse_tosec_category("Unknown System - Games.dat"),
-            None
-        );
+        assert_eq!(parse_tosec_category("Unknown System - Games.dat"), None);
     }
 
     #[test]
     fn test_deep_category() {
         assert_eq!(
-            parse_tosec_category("Acorn Archimedes - Collections - Skyfall Archimedes Public Domain - [ADF] (TOSEC-v2024-07-03_CM).dat"),
+            parse_tosec_category(
+                "Acorn Archimedes - Collections - Skyfall Archimedes Public Domain - [ADF] (TOSEC-v2024-07-03_CM).dat"
+            ),
             Some("Acorn/Archimedes/Collections/Skyfall Archimedes Public Domain/[ADF]".to_string())
         );
     }
 }
-

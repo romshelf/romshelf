@@ -1,4 +1,6 @@
-# Bitshelf
+# Romshelf
+
+> Renamed from **Bitshelf** after discovering the GitHub organisation name was already taken.
 
 A ROM collection manager with DAT-driven verification and organisation.
 
@@ -23,65 +25,65 @@ cargo install --path .
 
 Import a single DAT file:
 ```bash
-bitshelf dat import /path/to/dat-file.dat
+romshelf dat import /path/to/dat-file.dat
 ```
 
 Import all DATs from a directory (recursive):
 ```bash
-bitshelf dat import-dir /path/to/dats/
+romshelf dat import-dir /path/to/dats/
 ```
 
 List imported DATs:
 ```bash
-bitshelf dat list
+romshelf dat list
 ```
 
 ### Scan ROMs
 
 Scan a directory for ROM files:
 ```bash
-bitshelf scan /path/to/roms/
+romshelf scan /path/to/roms/
 ```
 
 Use multiple threads:
 ```bash
-bitshelf scan /path/to/roms/ --threads 8
+romshelf scan /path/to/roms/ --threads 8
 ```
 
 ### Verify Collection
 
 Check your scanned files against loaded DATs:
 ```bash
-bitshelf verify
+romshelf verify
 ```
 
 Show detailed issues (misnamed files, unmatched files):
 ```bash
-bitshelf verify --issues
+romshelf verify --issues
 ```
 
 ### Organise Collection
 
 Move matched files into a structured directory:
 ```bash
-bitshelf organise --target /path/to/organised/
+romshelf organise --target /path/to/organised/
 ```
 
 Preview what would happen without making changes:
 ```bash
-bitshelf organise --target /path/to/organised/ --dry-run
+romshelf organise --target /path/to/organised/ --dry-run
 ```
 
 Copy instead of moving:
 ```bash
-bitshelf organise --target /path/to/organised/ --copy
+romshelf organise --target /path/to/organised/ --copy
 ```
 
 ### View Statistics
 
 Show collection overview with category tree:
 ```bash
-bitshelf stats
+romshelf stats
 ```
 
 ## Category Organisation
@@ -103,7 +105,7 @@ If you organise your DAT files into subdirectories before importing, the directo
     Sony - PlayStation.dat
 ```
 
-Running `bitshelf dat import-dir /path/to/dats/` produces categories:
+Running `romshelf dat import-dir /path/to/dats/` produces categories:
 - `TOSEC/Commodore/Amiga/Games/[ADF]`
 - `TOSEC/GCE/Vectrex/Games`
 - `No-Intro`
@@ -111,7 +113,7 @@ Running `bitshelf dat import-dir /path/to/dats/` produces categories:
 
 ### TOSEC filename parsing
 
-For flat TOSEC DAT packs (all files in one directory), Bitshelf automatically parses the TOSEC naming convention to extract categories:
+For flat TOSEC DAT packs (all files in one directory), Romshelf automatically parses the TOSEC naming convention to extract categories:
 
 - `Commodore Amiga - Games - [ADF] (TOSEC-v2025).dat` → `Commodore/Amiga/Games/[ADF]`
 - `GCE Vectrex - Demos - Music (TOSEC-v2023).dat` → `GCE/Vectrex/Demos/Music`
@@ -134,7 +136,7 @@ For the best organisation, create top-level folders for each DAT source:
 
 Then import with:
 ```bash
-bitshelf dat import-dir /dats/
+romshelf dat import-dir /dats/
 ```
 
 The category tree will show:
@@ -158,7 +160,7 @@ Category Tree
 
 ## Database
 
-Bitshelf stores its database at `~/.bitshelf/bitshelf.db` (SQLite).
+Romshelf stores its database at `~/.romshelf/romshelf.db` (SQLite).
 
 ## Supported DAT Formats
 

@@ -1,6 +1,6 @@
 //! Database module - SQLite connection, schema, queries
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -118,7 +118,10 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
 
     // Add directory_id column to files if not exists
     if !column_exists(conn, "files", "directory_id")? {
-        conn.execute("ALTER TABLE files ADD COLUMN directory_id INTEGER REFERENCES directories(id)", [])?;
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN directory_id INTEGER REFERENCES directories(id)",
+            [],
+        )?;
     }
 
     Ok(())
@@ -142,8 +145,7 @@ pub fn get_collection_stats(conn: &Connection) -> Result<CollectionStats> {
     let entry_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM dat_entries", [], |row| row.get(0))?;
 
-    let scanned_files: i64 =
-        conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+    let scanned_files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
     let matched_files: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT f.id) FROM files f
@@ -317,7 +319,10 @@ pub fn get_file_tree(conn: &Connection) -> Result<FileTreeNode> {
     for file in files {
         // Use the directory part of the path
         let path_obj = std::path::Path::new(&file.path);
-        let dir_path = path_obj.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let dir_path = path_obj
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         let parts: Vec<&str> = dir_path.split('/').filter(|s| !s.is_empty()).collect();
 
         insert_file_into_tree(&mut root, &parts, file);
@@ -368,8 +373,8 @@ fn compute_file_tree_stats(node: &mut FileTreeNode) {
     }
 
     // Sum up totals
-    node.total_files = node.files.len() as i64
-        + node.children.iter().map(|c| c.total_files).sum::<i64>();
+    node.total_files =
+        node.files.len() as i64 + node.children.iter().map(|c| c.total_files).sum::<i64>();
     node.matched_files = node.files.iter().filter(|f| f.matched).count() as i64
         + node.children.iter().map(|c| c.matched_files).sum::<i64>();
 }
@@ -422,7 +427,12 @@ pub fn get_or_create_directory(conn: &Connection, path: &str) -> Result<i64> {
 }
 
 /// Update directory stats after scanning
-pub fn update_directory_stats(conn: &Connection, dir_id: i64, size: i64, matched: bool) -> Result<()> {
+pub fn update_directory_stats(
+    conn: &Connection,
+    dir_id: i64,
+    size: i64,
+    matched: bool,
+) -> Result<()> {
     conn.execute(
         "UPDATE directories SET
             file_count = file_count + 1,

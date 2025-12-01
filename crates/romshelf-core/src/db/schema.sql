@@ -1,4 +1,4 @@
--- Bitshelf database schema (Milestone 1 - simplified)
+-- Romshelf database schema (Milestone 1 - simplified)
 
 -- DATs
 CREATE TABLE IF NOT EXISTS dats (

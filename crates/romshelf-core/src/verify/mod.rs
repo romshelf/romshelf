@@ -67,24 +67,25 @@ pub fn verify(files: &[ScannedFile], entries: &[DatEntry]) -> VerifyResult {
 fn find_match<'a>(file: &ScannedFile, entries: &'a [DatEntry]) -> Option<(usize, &'a DatEntry)> {
     for (idx, entry) in entries.iter().enumerate() {
         // First try SHA1 (most reliable)
-        if let Some(ref sha1) = entry.sha1 {
-            if sha1 == &file.sha1 {
-                return Some((idx, entry));
-            }
+        if let Some(ref sha1) = entry.sha1
+            && sha1 == &file.sha1
+        {
+            return Some((idx, entry));
         }
 
         // Fall back to CRC32 + size
-        if let Some(ref crc32) = entry.crc32 {
-            if crc32 == &file.crc32 && entry.size == file.size {
-                return Some((idx, entry));
-            }
+        if let Some(ref crc32) = entry.crc32
+            && crc32 == &file.crc32
+            && entry.size == file.size
+        {
+            return Some((idx, entry));
         }
 
         // Fall back to MD5
-        if let Some(ref md5) = entry.md5 {
-            if md5 == &file.md5 {
-                return Some((idx, entry));
-            }
+        if let Some(ref md5) = entry.md5
+            && md5 == &file.md5
+        {
+            return Some((idx, entry));
         }
     }
 
