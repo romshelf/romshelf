@@ -36,6 +36,7 @@ jobs:
         run: cargo test --all
 
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
