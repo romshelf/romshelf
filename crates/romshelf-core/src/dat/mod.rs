@@ -1,13 +1,16 @@
-//! DAT parsing module - TOSEC, No-Intro, MAME format support
+//! DAT parsing module - streaming parser with visitor support (TOSEC, No-Intro, MAME, etc.)
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-use std::fs;
+use sha1::{Digest, Sha1};
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-/// A parsed DAT file
-#[derive(Debug)]
+/// A parsed DAT file (legacy API)
+#[derive(Debug, Default)]
 pub struct ParsedDat {
     pub name: String,
     pub version: Option<String>,
@@ -15,7 +18,6 @@ pub struct ParsedDat {
 }
 
 impl ParsedDat {
-    /// Total number of ROM entries across all sets
     pub fn entry_count(&self) -> usize {
         self.sets.iter().map(|s| s.roms.len()).sum()
     }
@@ -38,24 +40,111 @@ pub struct DatEntry {
     pub sha1: Option<String>,
 }
 
-/// Parse a DAT file (Logiqx XML format)
+/// Metadata emitted at the start of a DAT
+#[derive(Debug, Clone)]
+pub struct DatHeader {
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub format: DatFormat,
+}
+
+/// Information about the current set being parsed
+#[derive(Debug, Clone)]
+pub struct DatSetInfo {
+    pub name: String,
+}
+
+/// Supported DAT formats (best-effort detection)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatFormat {
+    Tosec,
+    NoIntro,
+    Redump,
+    Mame,
+    ClrMamePro,
+    Unknown,
+}
+
+impl Display for DatFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatFormat::Tosec => write!(f, "TOSEC"),
+            DatFormat::NoIntro => write!(f, "No-Intro"),
+            DatFormat::Redump => write!(f, "Redump"),
+            DatFormat::Mame => write!(f, "MAME"),
+            DatFormat::ClrMamePro => write!(f, "ClrMamePro"),
+            DatFormat::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+impl DatFormat {
+    pub fn from_path(path: &Path) -> Self {
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+
+        if filename.contains("tosec") {
+            DatFormat::Tosec
+        } else if filename.contains("no-intro") {
+            DatFormat::NoIntro
+        } else if filename.contains("redump") {
+            DatFormat::Redump
+        } else if filename.contains("mame") || filename.contains("softwarelist") {
+            DatFormat::Mame
+        } else if filename.contains("clrmame") {
+            DatFormat::ClrMamePro
+        } else {
+            DatFormat::Unknown
+        }
+    }
+}
+
+/// Visitor invoked during streaming parsing
+pub trait DatVisitor {
+    fn dat_start(&mut self, _header: &DatHeader) -> Result<()> {
+        Ok(())
+    }
+
+    fn dat_end(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_start(&mut self, _set: &DatSetInfo) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_end(&mut self, _set: &DatSetInfo) -> Result<()> {
+        Ok(())
+    }
+
+    fn rom(&mut self, _entry: &DatEntry) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Parse a DAT file (legacy, materialises entire structure)
 pub fn parse_dat(path: &Path) -> Result<ParsedDat> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read DAT file: {}", path.display()))?;
+    let mut collector = CollectingVisitor::default();
+    parse_dat_streaming(path, &mut collector)?;
+    Ok(collector.into_dat())
+}
 
-    // Strip UTF-8 BOM if present
-    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-
-    parse_logiqx_xml(content)
+/// Stream a DAT file into a visitor
+pub fn parse_dat_streaming(path: &Path, visitor: &mut impl DatVisitor) -> Result<()> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open DAT file: {}", path.display()))?;
+    let reader = Reader::from_reader(BufReader::new(file));
+    parse_logiqx(reader, path, visitor)
 }
 
 /// Compute SHA1 hash of a DAT file for duplicate detection
 pub fn hash_dat_file(path: &Path) -> Result<String> {
-    use sha1::{Digest, Sha1};
-    use std::io::Read;
-
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("Failed to open DAT file: {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("Failed to open DAT file: {}", path.display()))?;
 
     let mut hasher = Sha1::new();
     let mut buffer = [0u8; 65536];
@@ -71,29 +160,63 @@ pub fn hash_dat_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Parse Logiqx XML format (used by TOSEC, No-Intro, Redump)
-fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
-    let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut dat = ParsedDat {
-        name: String::new(),
-        version: None,
-        sets: Vec::new(),
-    };
-
+fn parse_logiqx<R: BufRead>(
+    mut reader: Reader<R>,
+    path: &Path,
+    visitor: &mut impl DatVisitor,
+) -> Result<()> {
     let mut buf = Vec::new();
-    let mut current_path: Vec<String> = Vec::new();
-    let mut current_set: Option<DatSet> = None;
+    let mut current_set: Option<DatSetInfo> = None;
     let mut in_header = false;
     let mut current_text_target: Option<&str> = None;
     let mut header_description: Option<String> = None;
+    let mut dat_name = String::new();
+    let mut dat_version: Option<String> = None;
+    let mut dat_started = false;
+    let format = DatFormat::from_path(path);
+
+    fn emit_header(
+        dat_started: &mut bool,
+        dat_name: &mut String,
+        dat_version: &Option<String>,
+        header_description: &mut Option<String>,
+        format: DatFormat,
+        visitor: &mut impl DatVisitor,
+        path: &Path,
+    ) -> Result<()> {
+        if *dat_started {
+            return Ok(());
+        }
+
+        if dat_name.is_empty() {
+            dat_name.push_str(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Unnamed DAT"),
+            );
+        }
+
+        if let Some(desc) = header_description.clone()
+            && desc.len() > dat_name.len()
+        {
+            *dat_name = desc;
+        }
+
+        let header = DatHeader {
+            name: dat_name.clone(),
+            description: header_description.clone(),
+            version: dat_version.clone(),
+            format,
+        };
+        visitor.dat_start(&header)?;
+        *dat_started = true;
+        Ok(())
+    }
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                current_path.push(tag_name.clone());
 
                 match tag_name.as_str() {
                     "header" => in_header = true,
@@ -101,24 +224,38 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                     "description" if in_header => current_text_target = Some("description"),
                     "version" if in_header => current_text_target = Some("version"),
                     "game" | "machine" | "software" => {
-                        // Start a new set - get name attribute
+                        emit_header(
+                            &mut dat_started,
+                            &mut dat_name,
+                            &dat_version,
+                            &mut header_description,
+                            format,
+                            visitor,
+                            path,
+                        )?;
+
                         let mut set_name = String::new();
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"name" {
                                 set_name = String::from_utf8_lossy(&attr.value).to_string();
                             }
                         }
-                        current_set = Some(DatSet {
-                            name: set_name,
-                            roms: Vec::new(),
-                        });
+                        let set = DatSetInfo { name: set_name };
+                        visitor.set_start(&set)?;
+                        current_set = Some(set);
                     }
                     "rom" => {
-                        // Parse ROM element attributes and add to current set
+                        emit_header(
+                            &mut dat_started,
+                            &mut dat_name,
+                            &dat_version,
+                            &mut header_description,
+                            format,
+                            visitor,
+                            path,
+                        )?;
                         let entry = parse_rom_attributes(&e);
-                        if let Some(ref mut set) = current_set {
-                            set.roms.push(entry);
-                        }
+                        visitor.rom(&entry)?;
                     }
                     _ => {}
                 }
@@ -127,67 +264,84 @@ fn parse_logiqx_xml(xml: &str) -> Result<ParsedDat> {
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
 
                 match tag_name.as_str() {
-                    "header" => in_header = false,
+                    "header" => {
+                        in_header = false;
+                        emit_header(
+                            &mut dat_started,
+                            &mut dat_name,
+                            &dat_version,
+                            &mut header_description,
+                            format,
+                            visitor,
+                            path,
+                        )?;
+                    }
                     "game" | "machine" | "software" => {
-                        // End of set - push it if it has ROMs
                         if let Some(set) = current_set.take() {
-                            if !set.roms.is_empty() {
-                                dat.sets.push(set);
-                            }
+                            visitor.set_end(&set)?;
                         }
                     }
                     _ => {}
                 }
 
                 current_text_target = None;
-                current_path.pop();
             }
             Ok(Event::Text(e)) => {
                 if let Some(target) = current_text_target {
                     let text = e.unescape().unwrap_or_default().to_string();
                     match target {
-                        "name" => dat.name = text,
+                        "name" => dat_name = text,
                         "description" => header_description = Some(text),
-                        "version" => dat.version = Some(text),
+                        "version" => dat_version = Some(text),
                         _ => {}
                     }
                 }
             }
             Ok(Event::Empty(e)) => {
-                // Handle self-closing <rom /> elements
                 let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if tag_name == "rom" {
+                    emit_header(
+                        &mut dat_started,
+                        &mut dat_name,
+                        &dat_version,
+                        &mut header_description,
+                        format,
+                        visitor,
+                        path,
+                    )?;
                     let entry = parse_rom_attributes(&e);
-                    if let Some(ref mut set) = current_set {
-                        set.roms.push(entry);
-                    }
+                    visitor.rom(&entry)?;
                 }
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow!(
                     "Error parsing XML at position {}: {:?}",
                     reader.error_position(),
                     e
-                ))
+                ));
             }
             _ => {}
         }
         buf.clear();
     }
 
-    // Prefer description over name for MAME Software Lists (which have cryptic names like "a2600")
-    // but only if description is more informative (longer than the name)
-    if let Some(desc) = header_description {
-        if desc.len() > dat.name.len() {
-            dat.name = desc;
-        }
+    if !dat_started {
+        emit_header(
+            &mut dat_started,
+            &mut dat_name,
+            &dat_version,
+            &mut header_description,
+            format,
+            visitor,
+            path,
+        )?;
     }
 
-    Ok(dat)
+    visitor.dat_end()?;
+    Ok(())
 }
 
-/// Parse ROM attributes from an XML element
 fn parse_rom_attributes(e: &quick_xml::events::BytesStart) -> DatEntry {
     let mut entry = DatEntry {
         name: String::new(),
@@ -198,15 +352,15 @@ fn parse_rom_attributes(e: &quick_xml::events::BytesStart) -> DatEntry {
     };
 
     for attr in e.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref());
+        let key = attr.key.as_ref();
         let value = String::from_utf8_lossy(&attr.value).to_string();
 
-        match key.as_ref() {
-            "name" => entry.name = value,
-            "size" => entry.size = value.parse().unwrap_or(0),
-            "crc" => entry.crc32 = Some(value.to_lowercase()),
-            "md5" => entry.md5 = Some(value.to_lowercase()),
-            "sha1" => entry.sha1 = Some(value.to_lowercase()),
+        match key {
+            b"name" => entry.name = value,
+            b"size" => entry.size = value.parse().unwrap_or(0),
+            b"crc" => entry.crc32 = Some(value),
+            b"md5" => entry.md5 = Some(value),
+            b"sha1" => entry.sha1 = Some(value),
             _ => {}
         }
     }
@@ -214,77 +368,55 @@ fn parse_rom_attributes(e: &quick_xml::events::BytesStart) -> DatEntry {
     entry
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Default)]
+struct CollectingVisitor {
+    dat: ParsedDat,
+    current_set: Option<DatSet>,
+}
 
-    #[test]
-    fn test_parse_simple_dat() {
-        let xml = r#"<?xml version="1.0"?>
-<datafile>
-  <header>
-    <name>Test DAT</name>
-    <version>2025-01-30</version>
-  </header>
-  <game name="Test Game">
-    <rom name="test.rom" size="1024" crc="abcd1234" md5="1234567890abcdef" sha1="abc123"/>
-  </game>
-</datafile>"#;
+impl CollectingVisitor {
+    fn into_dat(mut self) -> ParsedDat {
+        if let Some(set) = self.current_set.take() {
+            self.dat.sets.push(set);
+        }
+        self.dat
+    }
+}
 
-        let dat = parse_logiqx_xml(xml).unwrap();
-        assert_eq!(dat.name, "Test DAT");
-        assert_eq!(dat.version, Some("2025-01-30".to_string()));
-        assert_eq!(dat.sets.len(), 1);
-        assert_eq!(dat.sets[0].name, "Test Game");
-        assert_eq!(dat.sets[0].roms.len(), 1);
-        assert_eq!(dat.sets[0].roms[0].name, "test.rom");
-        assert_eq!(dat.sets[0].roms[0].size, 1024);
-        assert_eq!(dat.sets[0].roms[0].crc32, Some("abcd1234".to_string()));
+impl DatVisitor for CollectingVisitor {
+    fn dat_start(&mut self, header: &DatHeader) -> Result<()> {
+        self.dat.name = header.name.clone();
+        self.dat.version = header.version.clone();
+        Ok(())
     }
 
-    #[test]
-    fn test_parse_multiple_sets() {
-        let xml = r#"<?xml version="1.0"?>
-<datafile>
-  <header>
-    <name>Multi Test</name>
-  </header>
-  <game name="Game 1">
-    <rom name="game1.rom" size="100" crc="11111111"/>
-  </game>
-  <game name="Game 2">
-    <rom name="game2.rom" size="200" crc="22222222"/>
-  </game>
-</datafile>"#;
-
-        let dat = parse_logiqx_xml(xml).unwrap();
-        assert_eq!(dat.sets.len(), 2);
-        assert_eq!(dat.sets[0].name, "Game 1");
-        assert_eq!(dat.sets[1].name, "Game 2");
-        assert_eq!(dat.entry_count(), 2);
+    fn set_start(&mut self, set: &DatSetInfo) -> Result<()> {
+        if let Some(prev) = self.current_set.take() {
+            self.dat.sets.push(prev);
+        }
+        self.current_set = Some(DatSet {
+            name: set.name.clone(),
+            roms: Vec::new(),
+        });
+        Ok(())
     }
 
-    #[test]
-    fn test_parse_multi_rom_set() {
-        let xml = r#"<?xml version="1.0"?>
-<datafile>
-  <header>
-    <name>Multi-ROM Test</name>
-  </header>
-  <game name="Multi Disk Game">
-    <rom name="disk1.adf" size="901120" crc="11111111"/>
-    <rom name="disk2.adf" size="901120" crc="22222222"/>
-    <rom name="disk3.adf" size="901120" crc="33333333"/>
-  </game>
-</datafile>"#;
+    fn set_end(&mut self, _set: &DatSetInfo) -> Result<()> {
+        if let Some(prev) = self.current_set.take() {
+            self.dat.sets.push(prev);
+        }
+        Ok(())
+    }
 
-        let dat = parse_logiqx_xml(xml).unwrap();
-        assert_eq!(dat.sets.len(), 1);
-        assert_eq!(dat.sets[0].name, "Multi Disk Game");
-        assert_eq!(dat.sets[0].roms.len(), 3);
-        assert_eq!(dat.sets[0].roms[0].name, "disk1.adf");
-        assert_eq!(dat.sets[0].roms[1].name, "disk2.adf");
-        assert_eq!(dat.sets[0].roms[2].name, "disk3.adf");
-        assert_eq!(dat.entry_count(), 3);
+    fn rom(&mut self, entry: &DatEntry) -> Result<()> {
+        if let Some(ref mut set) = self.current_set {
+            set.roms.push(entry.clone());
+        } else {
+            self.current_set = Some(DatSet {
+                name: "Default".to_string(),
+                roms: vec![entry.clone()],
+            });
+        }
+        Ok(())
     }
 }

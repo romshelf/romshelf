@@ -3654,6 +3654,8 @@ dependencies = [
  "num_cpus",
  "romshelf-core",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sevenz-rust",
  "tempfile",
  "walkdir",
@@ -3688,6 +3690,7 @@ dependencies = [
 name = "romshelf-gui"
 version = "0.1.0"
 dependencies = [
+ "num_cpus",
  "romshelf-core",
  "serde",
  "serde_json",
