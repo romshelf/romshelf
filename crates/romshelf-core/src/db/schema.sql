@@ -94,6 +94,18 @@ CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories(parent_id);
 -- Foreign key from files to directories
 -- Note: directory_id is added via migration, not here
 
+-- Checkpoints for resumable operations
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    last_token TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_job_source
+    ON checkpoints(job_type, source);
+
 -- Schema migrations for existing databases
 -- Add mtime column to files if not exists
 -- SQLite doesn't have IF NOT EXISTS for columns, but we handle this in code

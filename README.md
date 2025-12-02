@@ -1,6 +1,4 @@
-# Romshelf
-
-> Renamed from **Bitshelf** after discovering the GitHub organisation name was already taken.
+# ROMShelf
 
 A ROM collection manager with DAT-driven verification and organisation.
 

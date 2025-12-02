@@ -46,6 +46,22 @@ pub struct ScanResult {
     pub duration: Duration,
 }
 
+/// Streamed output emitted as scan progresses
+#[derive(Debug, Clone)]
+pub enum ScanOutput {
+    File(ScannedFile),
+    Skipped { path: PathBuf },
+}
+
+type SkipPredicate = dyn Fn(&Path, u64, Option<i64>) -> bool + Send + Sync;
+
+/// Additional configuration for scanning
+#[derive(Clone, Default)]
+pub struct ScanOptions {
+    pub output_tx: Option<Sender<ScanOutput>>,
+    pub skip_predicate: Option<Arc<SkipPredicate>>,
+}
+
 /// Progress for a single file being processed
 #[derive(Debug, Clone)]
 pub struct FileProgress {
@@ -202,8 +218,20 @@ pub fn scan_directory_parallel(
     progress: Arc<ScanProgress>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<ScanResult> {
+    scan_directory_parallel_with_options(path, threads, progress, cancel, ScanOptions::default())
+}
+
+/// Scan a directory with optional streaming and skip predicate support
+pub fn scan_directory_parallel_with_options(
+    path: &Path,
+    threads: usize,
+    progress: Arc<ScanProgress>,
+    cancel: Option<Arc<AtomicBool>>,
+    options: ScanOptions,
+) -> Result<ScanResult> {
     let start_time = Instant::now();
     let (sender, receiver) = bounded::<WorkItem>(1000);
+    let skip_predicate = options.skip_predicate.clone();
 
     // Shared state for results
     let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -216,12 +244,16 @@ pub fn scan_directory_parallel(
 
     // Discovery thread - walks directories and pushes work items
     let cancel_discovery = cancel.clone();
+    let discovery_skip = skip_predicate.clone();
+    let discovery_output = options.output_tx.clone();
     let discovery_handle = std::thread::spawn(move || {
         discover_files(
             &path_owned,
             sender,
             &progress_discovery,
             cancel_discovery.as_ref(),
+            discovery_skip,
+            discovery_output,
         )
     });
 
@@ -237,11 +269,13 @@ pub fn scan_directory_parallel(
         .build()
         .unwrap();
 
+    let process_output = options.output_tx.clone();
     let files: Vec<ScannedFile> = pool.install(|| {
+        let worker_output = process_output.clone();
         receiver
             .into_iter()
             .par_bridge()
-            .flat_map(|item| {
+            .flat_map(move |item| {
                 let result = process_work_item(
                     item,
                     &skipped_clone,
@@ -249,6 +283,7 @@ pub fn scan_directory_parallel(
                     &sevenz_count_clone,
                     &progress_clone,
                     cancel.as_ref(),
+                    worker_output.clone(),
                 );
                 progress_clone.processed.fetch_add(1, Ordering::Relaxed);
                 result
@@ -308,6 +343,8 @@ fn discover_files(
     sender: Sender<WorkItem>,
     progress: &ScanProgress,
     cancel: Option<&Arc<AtomicBool>>,
+    skip_predicate: Option<Arc<SkipPredicate>>,
+    output_tx: Option<Sender<ScanOutput>>,
 ) -> Result<()> {
     for entry in WalkDir::new(path).follow_links(true) {
         if cancel
@@ -332,15 +369,48 @@ fn discover_files(
 
         if entry.file_type().is_file() {
             let file_path = entry.path().to_path_buf();
+            let metadata = if skip_predicate.is_some() {
+                match entry.metadata().or_else(|_| std::fs::metadata(&file_path)) {
+                    Ok(m) => Some(m),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let mut skipped = false;
             let item = if is_zip_file(&file_path) {
                 WorkItem::ZipArchive(file_path)
             } else if is_7z_file(&file_path) {
                 WorkItem::SevenZArchive(file_path)
             } else {
-                WorkItem::File(file_path)
+                if let (Some(predicate), Some(meta)) = (&skip_predicate, &metadata) {
+                    let size = meta.len();
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    if predicate(&file_path, size, mtime) {
+                        skipped = true;
+                        if let Some(tx) = output_tx.as_ref() {
+                            let _ = tx.send(ScanOutput::Skipped {
+                                path: file_path.clone(),
+                            });
+                        }
+                        WorkItem::File(PathBuf::new())
+                    } else {
+                        WorkItem::File(file_path)
+                    }
+                } else {
+                    WorkItem::File(file_path)
+                }
             };
 
             progress.discovered.fetch_add(1, Ordering::Relaxed);
+            if skipped {
+                progress.processed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
 
             if sender.send(item).is_err() {
                 break; // Receiver dropped, stop discovery
@@ -358,6 +428,7 @@ fn process_work_item(
     sevenz_count: &Arc<AtomicU64>,
     progress: &Arc<ScanProgress>,
     cancel: Option<&Arc<AtomicBool>>,
+    output_tx: Option<Sender<ScanOutput>>,
 ) -> Vec<ScannedFile> {
     // Get a unique worker ID for this work item
     let worker_id = progress.get_worker_id();
@@ -371,7 +442,12 @@ fn process_work_item(
                 return Vec::new();
             }
             match hash_file_with_progress(path, Some(progress), worker_id) {
-                Ok(f) => vec![f],
+                Ok(f) => {
+                    if let Some(tx) = output_tx.as_ref() {
+                        let _ = tx.send(ScanOutput::File(f.clone()));
+                    }
+                    vec![f]
+                }
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
                         path: path.clone(),
@@ -390,7 +466,14 @@ fn process_work_item(
             }
             zip_count.fetch_add(1, Ordering::Relaxed);
             match scan_zip_archive_with_progress(path, progress, worker_id) {
-                Ok(files) => files,
+                Ok(files) => {
+                    if let Some(tx) = output_tx.as_ref() {
+                        for f in &files {
+                            let _ = tx.send(ScanOutput::File(f.clone()));
+                        }
+                    }
+                    files
+                }
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
                         path: path.clone(),
@@ -409,7 +492,14 @@ fn process_work_item(
             }
             sevenz_count.fetch_add(1, Ordering::Relaxed);
             match scan_7z_archive_with_progress(path, progress, worker_id) {
-                Ok(files) => files,
+                Ok(files) => {
+                    if let Some(tx) = output_tx.as_ref() {
+                        for f in &files {
+                            let _ = tx.send(ScanOutput::File(f.clone()));
+                        }
+                    }
+                    files
+                }
                 Err(e) => {
                     skipped.lock().unwrap().push(SkippedFile {
                         path: path.clone(),
@@ -425,7 +515,8 @@ fn process_work_item(
 /// Legacy single-threaded scan (for compatibility)
 pub fn scan_directory(path: &Path) -> Result<Vec<ScannedFile>> {
     let progress = Arc::new(ScanProgress::new());
-    let result = scan_directory_parallel(path, 1, progress, None)?;
+    let result =
+        scan_directory_parallel_with_options(path, 1, progress, None, ScanOptions::default())?;
     Ok(result.files)
 }
 
@@ -690,5 +781,41 @@ mod tests {
         assert!(is_7z_file(Path::new("game.7Z")));
         assert!(!is_7z_file(Path::new("game.zip")));
         assert!(!is_7z_file(Path::new("game")));
+    }
+
+    #[test]
+    fn test_scan_respects_skip_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_a = dir.path().join("keep.bin");
+        let file_b = dir.path().join("skip.bin");
+        std::fs::write(&file_a, b"alpha").unwrap();
+        std::fs::write(&file_b, b"beta").unwrap();
+
+        let progress = Arc::new(ScanProgress::new());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let skip_target = file_b.clone();
+        let skip_predicate: Arc<dyn Fn(&Path, u64, Option<i64>) -> bool + Send + Sync> =
+            Arc::new(move |path, _size, _mtime| path == skip_target.as_path());
+
+        let result = scan_directory_parallel_with_options(
+            dir.path(),
+            1,
+            progress,
+            None,
+            ScanOptions {
+                output_tx: Some(tx),
+                skip_predicate: Some(skip_predicate),
+            },
+        )
+        .unwrap();
+
+        let outputs: Vec<_> = rx.iter().collect();
+        assert!(
+            outputs
+                .iter()
+                .any(|out| matches!(out, ScanOutput::Skipped { path } if path == &file_b))
+        );
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, file_a);
     }
 }

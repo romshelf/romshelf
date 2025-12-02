@@ -23,3 +23,4 @@ tempfile.workspace = true
 sevenz-rust.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+crossbeam-channel.workspace = true

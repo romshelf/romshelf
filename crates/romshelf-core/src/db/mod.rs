@@ -1,7 +1,8 @@
 //! Database module - SQLite connection, schema, queries
 
 use anyhow::{Result, anyhow};
-use rusqlite::Connection;
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +68,15 @@ pub struct DirectorySummary {
     pub matched_count: i64,
     pub total_size: i64,
     pub child_count: i64,
+}
+
+/// Checkpoint information for resumable jobs
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    pub job_type: String,
+    pub source: String,
+    pub last_token: String,
+    pub updated_at: String,
 }
 
 /// Get the default database path (~/.romshelf/romshelf.db)
@@ -457,6 +467,58 @@ pub fn update_directory_stats(
     }
 
     Ok(())
+}
+
+/// Update or insert a checkpoint for resumable operations
+pub fn upsert_checkpoint(
+    conn: &Connection,
+    job_type: &str,
+    source: &str,
+    last_token: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO checkpoints (job_type, source, last_token, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(job_type, source)
+         DO UPDATE SET last_token = excluded.last_token,
+                       updated_at = excluded.updated_at",
+        rusqlite::params![job_type, source, last_token, now],
+    )?;
+    Ok(())
+}
+
+/// Clear a checkpoint when a job completes successfully
+pub fn delete_checkpoint(conn: &Connection, job_type: &str, source: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM checkpoints WHERE job_type = ?1 AND source = ?2",
+        rusqlite::params![job_type, source],
+    )?;
+    Ok(())
+}
+
+/// Retrieve checkpoint state if one exists
+pub fn get_checkpoint(
+    conn: &Connection,
+    job_type: &str,
+    source: &str,
+) -> Result<Option<Checkpoint>> {
+    let mut stmt = conn.prepare(
+        "SELECT job_type, source, last_token, updated_at
+         FROM checkpoints
+         WHERE job_type = ?1 AND source = ?2",
+    )?;
+    let checkpoint = stmt
+        .query_row(rusqlite::params![job_type, source], |row| {
+            Ok(Checkpoint {
+                job_type: row.get(0)?,
+                source: row.get(1)?,
+                last_token: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })
+        .optional()?;
+    Ok(checkpoint)
 }
 
 /// Get root directories (top-level scan roots)

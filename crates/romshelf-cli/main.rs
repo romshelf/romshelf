@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use crossbeam_channel::unbounded;
 use serde::Serialize;
 use serde_json::json;
 use std::io::{self, BufRead, Write};
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use romshelf_core::dat;
 use romshelf_core::db;
@@ -882,7 +883,7 @@ fn cmd_scan(
     }
 
     // Load existing files from database for incremental scan
-    let existing_files: std::collections::HashMap<String, (i64, Option<i64>)> = {
+    let existing_files: Arc<std::collections::HashMap<String, (i64, Option<i64>)>> = Arc::new({
         let mut stmt = conn.prepare("SELECT path, size, mtime FROM files")?;
         stmt.query_map([], |row| {
             Ok((
@@ -892,7 +893,7 @@ fn cmd_scan(
         })?
         .filter_map(|r| r.ok())
         .collect()
-    };
+    });
 
     let existing_count = existing_files.len();
     if !json_progress {
@@ -912,6 +913,18 @@ fn cmd_scan(
         }
         eprintln!("  Discovering directories and files...");
     }
+
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let checkpoint_source = canonical_path.to_string_lossy().to_string();
+    if let Some(cp) = db::get_checkpoint(conn, "scan", &checkpoint_source)? {
+        if !json_progress {
+            eprintln!(
+                "Previous scan interrupted (last file: {}). Resuming...",
+                cp.last_token
+            );
+        }
+    }
+    db::upsert_checkpoint(conn, "scan", &checkpoint_source, "starting")?;
 
     let progress = if json_progress {
         let sink: Arc<dyn ProgressSink<ScanEvent>> = Arc::new(progress_sink.clone());
@@ -1082,14 +1095,40 @@ fn cmd_scan(
         }))
     };
 
-    // Run the scan
-    let result =
-        scan::scan_directory_parallel(path, thread_count, progress, Some(cancel_flag.clone()))?;
+    // Stream results to the database instead of buffering everything in memory
+    let (output_tx, output_rx) = unbounded::<scan::ScanOutput>();
+    let skip_map = Arc::clone(&existing_files);
+    let skip_root = path.to_path_buf();
+    let skip_predicate: Arc<dyn Fn(&Path, u64, Option<i64>) -> bool + Send + Sync> =
+        Arc::new(move |file_path, size, mtime| {
+            if !file_path.starts_with(&skip_root) {
+                return false;
+            }
+            let key = file_path.to_string_lossy().to_string();
+            if let Some(&(existing_size, existing_mtime)) = skip_map.get(&key) {
+                existing_size == size as i64 && existing_mtime == mtime
+            } else {
+                false
+            }
+        });
 
-    // Wait for progress display to finish
-    if let Some(handle) = display_handle {
-        let _ = handle.join();
-    }
+    let scan_path = path.to_path_buf();
+    let progress_for_scan = Arc::clone(&progress);
+    let cancel_for_scan = cancel_flag.clone();
+    let scan_options = scan::ScanOptions {
+        output_tx: Some(output_tx.clone()),
+        skip_predicate: Some(skip_predicate),
+    };
+    let scan_handle = thread::spawn(move || {
+        scan::scan_directory_parallel_with_options(
+            &scan_path,
+            thread_count,
+            progress_for_scan,
+            Some(cancel_for_scan),
+            scan_options,
+        )
+    });
+    drop(output_tx);
 
     // Track paths we've seen (for detecting missing files)
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1107,49 +1146,74 @@ fn cmd_scan(
     let mut new_files = 0;
     let mut updated_files = 0;
     let mut unchanged_files = 0;
+    let mut last_checkpoint_token = String::from("starting");
+    let mut last_checkpoint_at = Instant::now();
 
-    for file in result.files.iter() {
-        let path_str = file.path.to_string_lossy().to_string();
-        seen_paths.insert(path_str.clone());
+    for output in output_rx.iter() {
+        match output {
+            scan::ScanOutput::File(file) => {
+                let path_str = file.path.to_string_lossy().to_string();
+                seen_paths.insert(path_str.clone());
+                last_checkpoint_token = path_str.clone();
 
-        // Check if file is unchanged (same size and mtime)
-        if let Some(&(existing_size, existing_mtime)) = existing_files.get(&path_str) {
-            if existing_size == file.size as i64 && existing_mtime == file.mtime {
-                // File unchanged - skip updating (but track it as seen)
-                unchanged_files += 1;
-                continue;
+                if let Some(&(existing_size, existing_mtime)) = existing_files.get(&path_str) {
+                    if existing_size == file.size as i64 && existing_mtime == file.mtime {
+                        unchanged_files += 1;
+                        continue;
+                    }
+                    updated_files += 1;
+                } else {
+                    new_files += 1;
+                }
+
+                let dir_path = file
+                    .path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let dir_id = if let Some(&id) = dir_cache.get(&dir_path) {
+                    id
+                } else {
+                    let id = db::get_or_create_directory(conn, &dir_path)?;
+                    dir_cache.insert(dir_path.clone(), id);
+                    id
+                };
+
+                stmt.execute(rusqlite::params![
+                    path_str,
+                    file.filename,
+                    file.size as i64,
+                    file.mtime,
+                    file.crc32,
+                    file.md5,
+                    file.sha1,
+                    now,
+                    dir_id
+                ])?;
             }
-            updated_files += 1;
-        } else {
-            new_files += 1;
+            scan::ScanOutput::Skipped { path } => {
+                let path_str = path.to_string_lossy().to_string();
+                seen_paths.insert(path_str.clone());
+                last_checkpoint_token = path_str;
+                unchanged_files += 1;
+            }
         }
 
-        // Get or create directory entry
-        let dir_path = file
-            .path
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        if last_checkpoint_at.elapsed() >= Duration::from_secs(1) {
+            db::upsert_checkpoint(conn, "scan", &checkpoint_source, &last_checkpoint_token)?;
+            last_checkpoint_at = Instant::now();
+        }
+    }
+    db::upsert_checkpoint(conn, "scan", &checkpoint_source, &last_checkpoint_token)?;
 
-        let dir_id = if let Some(&id) = dir_cache.get(&dir_path) {
-            id
-        } else {
-            let id = db::get_or_create_directory(conn, &dir_path)?;
-            dir_cache.insert(dir_path.clone(), id);
-            id
-        };
+    let result = scan_handle
+        .join()
+        .map_err(|e| anyhow!("Scan worker panicked: {:?}", e))??;
 
-        stmt.execute(rusqlite::params![
-            path_str,
-            file.filename,
-            file.size as i64,
-            file.mtime,
-            file.crc32,
-            file.md5,
-            file.sha1,
-            now,
-            dir_id
-        ])?;
+    // Wait for progress display to finish
+    if let Some(handle) = display_handle {
+        let _ = handle.join();
     }
 
     // Handle missing files (files in DB that were under this scan path but weren't found)
@@ -1172,8 +1236,9 @@ fn cmd_scan(
     } else {
         result.total_bytes as f64
     };
+    let total_committed = new_files + updated_files + unchanged_files;
     let files_per_sec = if duration_secs > 0.0 {
-        result.files.len() as f64 / duration_secs
+        total_committed as f64 / duration_secs
     } else {
         0.0
     };
@@ -1187,7 +1252,7 @@ fn cmd_scan(
         },
         result.duration.as_secs_f32()
     );
-    println!("  Files:      {:>6}", result.files.len());
+    println!("  Files:      {:>6}", total_committed);
     println!(
         "  Data:       {:>6}",
         format_bytes(result.total_bytes as i64)
@@ -1219,6 +1284,10 @@ fn cmd_scan(
         files_per_sec,
         format_bytes(bytes_per_sec as i64)
     );
+
+    if !cancel_flag.load(Ordering::Relaxed) {
+        db::delete_checkpoint(conn, "scan", &checkpoint_source)?;
+    }
 
     // Show skipped files if any
     if !result.skipped.is_empty() {
